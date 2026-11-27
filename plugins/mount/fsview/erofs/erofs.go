@@ -17,6 +17,7 @@
 package erofs
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -79,6 +80,14 @@ func handleMount(m mount.Mount) (fsview.View, error) {
 		}
 	}
 
+	if len(extraDevices) == 0 {
+		extraDevices, err = flatDevices(f)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+
 	var opts []erofs.OpenOpt
 	if len(extraDevices) > 0 {
 		opts = append(opts, erofs.WithExtraDevices(extraDevices...))
@@ -107,6 +116,77 @@ func handleMount(m mount.Mount) (fsview.View, error) {
 		ReadLinkFS: rlfs,
 		closers:    closers,
 	}, nil
+}
+
+// The on-disk format of the superblock and the device table, from the Linux
+// kernel's fs/erofs/erofs_fs.h: struct erofs_super_block and struct
+// erofs_deviceslot, with the offsets of the fields read here.
+const (
+	superBlockOffset           = 1024
+	superBlockSize             = 128
+	erofsMagic                 = 0xe0f5e1e2
+	featureIncompatDeviceTable = 0x8
+
+	sbBlkSizeBits     = 12 // u8
+	sbFeatureIncompat = 80 // le32
+	sbExtraDevices    = 86 // le16
+	sbDevtSlotOff     = 88 // le16, in device slots
+
+	deviceSlotSize    = 128
+	slotBlocks        = 64 // le32
+	slotMappedBlkAddr = 68 // le32
+)
+
+// flatDevices returns the extra devices of an EROFS image that holds them
+// itself, each read from the image at the block address it is mapped to.
+//
+// A tar index layer is such an image: mkfs.erofs --tar=i writes an index that
+// addresses the tar as an extra device mapped right behind the index, and the
+// tar is appended to the index. Mounted without device= options, the kernel
+// reads every extra device from the image this way (flat device mode).
+//
+// An image without a device table, or with a device that is not mapped within
+// the image, gets no devices: it needs them named with device= options.
+func flatDevices(f *os.File) ([]io.ReaderAt, error) {
+	var sb [superBlockSize]byte
+	if _, err := f.ReadAt(sb[:], superBlockOffset); err != nil {
+		if errors.Is(err, io.EOF) {
+			// Too short for an image. erofs.Open reports it.
+			return nil, nil
+		}
+		return nil, err
+	}
+	if binary.LittleEndian.Uint32(sb[0:]) != erofsMagic ||
+		binary.LittleEndian.Uint32(sb[sbFeatureIncompat:])&featureIncompatDeviceTable == 0 {
+		return nil, nil
+	}
+	blkSizeBits := sb[sbBlkSizeBits]
+	if blkSizeBits < 9 || blkSizeBits > 16 {
+		// erofs.Open reports the invalid block size.
+		return nil, nil
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	count := int64(binary.LittleEndian.Uint16(sb[sbExtraDevices:]))
+	slotOffset := int64(binary.LittleEndian.Uint16(sb[sbDevtSlotOff:])) * deviceSlotSize
+	devices := make([]io.ReaderAt, 0, count)
+	for i := range count {
+		var slot [deviceSlotSize]byte
+		if _, err := f.ReadAt(slot[:], slotOffset+i*deviceSlotSize); err != nil {
+			return nil, fmt.Errorf("failed to read erofs device slot %d: %w", i, err)
+		}
+		blocks := int64(binary.LittleEndian.Uint32(slot[slotBlocks:]))
+		mappedBlkAddr := int64(binary.LittleEndian.Uint32(slot[slotMappedBlkAddr:]))
+		offset, size := mappedBlkAddr<<blkSizeBits, blocks<<blkSizeBits
+		if mappedBlkAddr == 0 || offset+size > fi.Size() {
+			return nil, nil
+		}
+		devices = append(devices, io.NewSectionReader(f, offset, size))
+	}
+	return devices, nil
 }
 
 type erofsView struct {

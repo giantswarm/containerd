@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -81,6 +82,26 @@ func makeEROFSFromTar(t *testing.T, wt tartest.WriterToTar) string {
 	defer rc.Close()
 	if err := erofsutils.ConvertTarErofs(context.Background(), rc, layerPath, ""); err != nil {
 		t.Fatalf("ConvertTarErofs failed: %v", err)
+	}
+	return layerPath
+}
+
+// makeTarIndexLayer converts a tar as the erofs differ does in tar index mode
+// with mkfs.erofs: the index from mkfs.erofs --tar=i, followed by the tar it
+// indexes.
+func makeTarIndexLayer(t *testing.T, wt tartest.WriterToTar) string {
+	t.Helper()
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skip("mkfs.erofs not found in PATH")
+	}
+	if supported, err := erofsutils.MkfsSupportsTar(); err != nil || !supported {
+		t.Skipf("mkfs.erofs does not support --tar= mode: %v", err)
+	}
+	layerPath := filepath.Join(t.TempDir(), "layer.erofs")
+	rc := tartest.TarFromWriterTo(wt)
+	defer rc.Close()
+	if err := erofsutils.MkfsGenerateTarIndex(t.Context(), rc, layerPath, "", nil); err != nil {
+		t.Fatalf("MkfsGenerateTarIndex failed: %v", err)
 	}
 	return layerPath
 }
@@ -409,4 +430,48 @@ func TestFormatMountIndexWithSuffix(t *testing.T) {
 	data, err := fs.ReadFile(viewFS, "etc/passwd")
 	require.NoError(t, err)
 	assert.Equal(t, "guest\n", string(data))
+}
+
+// TestFSMountsOverlayTarIndexLayers reads the user and group files of a
+// container's rootfs whose image layers are tar index layers, mounted the way
+// the erofs snapshotter mounts them.
+func TestFSMountsOverlayTarIndexLayers(t *testing.T) {
+	passwd := "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000::/home/app:/bin/sh\n"
+	group := "root:x:0:\napp:x:1000:\n"
+	tc := tartest.TarContext{}.WithModTime(time.Now().UTC())
+	lower := makeTarIndexLayer(t, tartest.TarAll(
+		tc.Dir("etc", 0o755),
+		tc.File("etc/passwd", []byte(passwd), 0o644),
+		tc.File("etc/group", []byte("root:x:0:\n"), 0o644),
+	))
+	upper := makeTarIndexLayer(t, tartest.TarAll(
+		tc.Dir("etc", 0o755),
+		tc.File("etc/group", []byte(group), 0o644),
+	))
+	upperDir := filepath.Join(t.TempDir(), "upper")
+	require.NoError(t, os.Mkdir(upperDir, 0o755))
+
+	v, err := fsview.FSMounts([]mount.Mount{
+		{Type: "erofs", Source: upper, Options: []string{"ro", "loop"}},
+		{Type: "erofs", Source: lower, Options: []string{"ro", "loop"}},
+		{
+			Type:   "format/mkdir/overlay",
+			Source: "overlay",
+			Options: []string{
+				"upperdir=" + upperDir,
+				"lowerdir={{ overlay 0 1 }}",
+			},
+		},
+	})
+	require.NoError(t, err)
+	defer v.Close()
+
+	for name, want := range map[string]string{
+		"etc/passwd": passwd,
+		"etc/group":  group,
+	} {
+		got, err := fs.ReadFile(v, name)
+		require.NoError(t, err, name)
+		assert.Equal(t, want, string(got), name)
+	}
 }
