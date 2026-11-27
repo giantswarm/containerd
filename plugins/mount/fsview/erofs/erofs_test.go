@@ -58,3 +58,18 @@ func TestHandleMountUnsupportedCompression(t *testing.T) {
 	require.ErrorIs(t, err, goerofs.ErrNotImplemented)
 	assert.ErrorIs(t, err, errdefs.ErrNotImplemented)
 }
+
+func TestHandleMountDmverity(t *testing.T) {
+	// The blob is not opened: a layer verified by dm-verity is left to the
+	// mount handler, whatever its contents.
+	layerPath := filepath.Join(t.TempDir(), "layer.erofs")
+
+	view, err := handleMount(mount.Mount{
+		Type:    "erofs",
+		Source:  layerPath,
+		Options: []string{"ro", "loop", "X-containerd.dmverity=" + layerPath + ".dmverity"},
+	})
+	require.Nil(t, view)
+	require.ErrorIs(t, err, errdefs.ErrNotImplemented)
+	assert.NotErrorIs(t, err, os.ErrNotExist)
+}

@@ -38,9 +38,22 @@ func init() {
 	})
 }
 
+// dmverityOption prefixes the mount option that names the dm-verity metadata of
+// an erofs layer: "X-containerd.dmverity=<metadata-path>".
+const dmverityOption = "X-containerd.dmverity="
+
 func handleMount(m mount.Mount) (fsview.View, error) {
 	if m.Type != "erofs" {
 		return nil, errdefs.ErrNotImplemented
+	}
+
+	for _, opt := range m.Options {
+		if strings.HasPrefix(opt, dmverityOption) {
+			// Reading the blob directly would skip dm-verity's check of every
+			// block read. Leave the layer to the mount handler, which reads it
+			// through its dm-verity device.
+			return nil, fmt.Errorf("erofs layer %s is verified by dm-verity: %w", m.Source, errdefs.ErrNotImplemented)
+		}
 	}
 
 	f, err := os.Open(m.Source)
