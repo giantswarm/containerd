@@ -56,6 +56,9 @@ type SnapshotterConfig struct {
 	remapIDs    bool
 	// dmverityMode controls dm-verity behavior: "auto" (use if .dmverity exists), "on" (require .dmverity), "off" (disable)
 	dmverityMode string
+	// dmverityReferrers requires every layer to be mounted through dm-verity
+	// with a root-hash signature (see WithDmverityReferrers)
+	dmverityReferrers bool
 	// layerContentCaches lists directories of pre-converted, diffID-keyed erofs
 	// layer blobs. Each is checked one by one; the first hit is recorded as the
 	// snapshot's blob source and mounted from the cache. A directory that
@@ -92,6 +95,17 @@ func WithImmutable() Opt {
 func WithDmverityMode(mode string) Opt {
 	return func(config *SnapshotterConfig) {
 		config.dmverityMode = mode
+	}
+}
+
+// WithDmverityReferrers requires every layer to carry the dm-verity metadata
+// and root-hash signature the erofs differ stores for a layer unpacked from a
+// signed dm-verity referrer. A layer without them is not mounted, whatever
+// made it: a snapshot unpacked before the option was enabled, a layer content
+// cache entry or a merged fsmeta.
+func WithDmverityReferrers() Opt {
+	return func(config *SnapshotterConfig) {
+		config.dmverityReferrers = true
 	}
 }
 
@@ -135,6 +149,7 @@ type snapshotter struct {
 	blockMode          bool
 	remapIDs           bool
 	dmverityMode       string
+	dmverityReferrers  bool
 	layerContentCaches []string
 }
 
@@ -154,6 +169,10 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 
 	if config.dmverityMode != "auto" && config.dmverityMode != "on" && config.dmverityMode != "off" {
 		return nil, fmt.Errorf("invalid dmverity_mode %q: must be \"auto\", \"on\", or \"off\"", config.dmverityMode)
+	}
+
+	if config.dmverityReferrers && config.dmverityMode == "off" {
+		return nil, errors.New("enable_dmverity_referrers requires dm-verity, but dmverity_mode is 'off'")
 	}
 
 	if config.dmverityMode == "on" {
@@ -238,6 +257,7 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		blockMode:          config.defaultSize > 0,
 		remapIDs:           config.remapIDs,
 		dmverityMode:       config.dmverityMode,
+		dmverityReferrers:  config.dmverityReferrers,
 		layerContentCaches: config.layerContentCaches,
 	}, nil
 }
@@ -337,6 +357,11 @@ func (s *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 }
 
 func (s *snapshotter) mountFsMeta(snap storage.Snapshot, parents []snapshots.Info, id int) (mount.Mount, bool, error) {
+	// A merged fsmeta addresses the layers as plain devices, without
+	// dm-verity. With signed layers required, each layer is mounted on its own.
+	if s.dmverityReferrers {
+		return mount.Mount{}, false, nil
+	}
 	mergedMeta := s.fsMetaPath(snap.ParentIDs[id])
 	if fi, err := os.Stat(mergedMeta); err != nil || fi.Size() == 0 {
 		return mount.Mount{}, false, nil
@@ -380,6 +405,12 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 	}
 	metadataExists := metadataErr == nil
 
+	if s.dmverityReferrers {
+		if err := requireDmveritySignature(layerBlob, metadataExists); err != nil {
+			return "", err
+		}
+	}
+
 	// Validate dmverityMode policy: mode "on" requires .dmverity metadata to exist
 	if s.dmverityMode == "on" && !metadataExists {
 		return "", fmt.Errorf("dm-verity mode is 'on' but .dmverity metadata not found for layer %s. "+
@@ -395,6 +426,25 @@ func (s *snapshotter) applyDmverityPolicy(layerBlob string) (string, error) {
 	}
 
 	return "", nil
+}
+
+// requireDmveritySignature refuses a layer without the dm-verity metadata and
+// root-hash signature that the erofs differ stores for a layer unpacked from a
+// signed dm-verity referrer. The mount handler passes the signature to the
+// kernel, which verifies it.
+func requireDmveritySignature(layerBlob string, metadataExists bool) error {
+	const remedy = "remove the snapshot and its descendants and pull the image again"
+	if !metadataExists {
+		return fmt.Errorf("layer %s has no dm-verity metadata and signed dm-verity layers are required: %s", layerBlob, remedy)
+	}
+	signaturePath := dmverity.SignaturePath(layerBlob)
+	if _, err := os.Stat(signaturePath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("layer %s has no dm-verity root-hash signature and signed dm-verity layers are required: %s", layerBlob, remedy)
+		}
+		return fmt.Errorf("failed to access dm-verity signature %s: %w", signaturePath, err)
+	}
+	return nil
 }
 
 // createErofsMount creates a mount specification for an EROFS layer.

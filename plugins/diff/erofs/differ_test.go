@@ -18,15 +18,44 @@ package erofs
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/containerd/errdefs"
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 )
+
+// TestApplyNativeLayerWithDmverityReferrers covers the refusal of a native
+// EROFS layer when every layer must come with a signed dm-verity target: such
+// a layer has none, so it is refused, naming it, before anything is written.
+// The uncompressed layer is the fastcopy path, which writes the blob as it is.
+func TestApplyNativeLayerWithDmverityReferrers(t *testing.T) {
+	d := erofsDiff{dmverityReferrers: true}
+	for _, mediaType := range []string{
+		images.MediaTypeErofsLayer,
+		images.MediaTypeErofsLayer + "+zstd",
+	} {
+		t.Run(mediaType, func(t *testing.T) {
+			layer := t.TempDir()
+			desc := ocispec.Descriptor{
+				MediaType: mediaType,
+				Digest:    digest.FromString(mediaType),
+				Size:      1,
+			}
+			mounts := []mount.Mount{{Type: "bind", Source: layer, Options: []string{"rbind", "rw"}}}
+
+			_, err := d.Apply(t.Context(), desc, mounts)
+			require.ErrorContains(t, err, "layer "+desc.Digest.String()+": signed dm-verity referrers apply to tar layers only")
+			assert.NoFileExists(t, filepath.Join(layer, "layer.erofs"))
+		})
+	}
+}
 
 // TestApplyReadOnlyMounts covers the differ's refusal to apply into a snapshot
 // the snapshotter has already populated, for example from a layer content

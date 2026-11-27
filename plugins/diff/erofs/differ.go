@@ -35,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/internal/erofsutils"
+	"github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 
 	"github.com/google/uuid"
@@ -56,6 +57,10 @@ type erofsDiff struct {
 	enableTarIndex bool
 	// enableDmverity enables formatting layers with dm-verity after creation
 	enableDmverity bool
+	// dmverityReferrers requires every tar layer to come with a signed
+	// dm-verity target from its image's referrer (see
+	// snapshotters.WithDmverityReferrers) and builds the layer from it
+	dmverityReferrers bool
 }
 
 // DifferOpt is an option for configuring the erofs differ
@@ -79,6 +84,16 @@ func WithTarIndexMode() DifferOpt {
 func WithDmverity() DifferOpt {
 	return func(d *erofsDiff) {
 		d.enableDmverity = true
+	}
+}
+
+// WithDmverityReferrers builds each tar layer from the EROFS tar index,
+// dm-verity hash tree and root-hash signature published in the image's
+// application/vnd.containerd.erofs.dmverity.v1 referrer, instead of running
+// mkfs.erofs and formatting dm-verity on the node. A layer without them fails.
+func WithDmverityReferrers() DifferOpt {
+	return func(d *erofsDiff) {
+		d.dmverityReferrers = true
 	}
 }
 
@@ -146,6 +161,11 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	)
 	diffLayerType := desc.MediaType
 	native := erofsutils.IsErofsMediaType(diffLayerType)
+	// A native EROFS layer is mounted as it is published, with no signed
+	// dm-verity target to check it against.
+	if native && s.dmverityReferrers {
+		return emptyDesc, fmt.Errorf("layer %s: signed dm-verity referrers apply to tar layers only, not %s", desc.Digest, desc.MediaType)
+	}
 	if native {
 		base, ext, hasExt := strings.Cut(diffLayerType, "+")
 		// Mimic the OCI layer for EROFS blobs for diff.NewProcessorChain(), so
@@ -233,6 +253,24 @@ func (s erofsDiff) Apply(ctx context.Context, desc ocispec.Descriptor, mounts []
 	// Choose between tar index or tar conversion mode
 	// Generate deterministic UUID from layer digest
 	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
+	if s.dmverityReferrers {
+		target, err := snapshotters.DmverityApplyTarget(config)
+		if err != nil {
+			return emptyDesc, fmt.Errorf("layer %s: %w", desc.Digest, err)
+		}
+		if target == nil {
+			return emptyDesc, fmt.Errorf("layer %s has no signed dm-verity root hash", desc.Digest)
+		}
+		mode = "signed-tar-index"
+		if err := s.applySignedTarIndex(ctx, desc, target, rc, layerBlobPath); err != nil {
+			return emptyDesc, err
+		}
+		return ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageLayer,
+			Size:      rc.c,
+			Digest:    digester.Digest(),
+		}, nil
+	}
 	if native {
 		f, err := os.Create(layerBlobPath)
 		if err != nil {

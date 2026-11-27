@@ -193,7 +193,7 @@ func setupDmVerityDevice(ctx context.Context, source, mountpoint string, metadat
 	}).Debug("opening dm-verity device")
 
 	// Try to create dm-verity device first (avoids TOCTOU race)
-	_, err = dmverity.Open(source, deviceName, source, metadata.RootHash, metadata.HashOffset, nil)
+	err = openLayerDevice(source, deviceName, metadata)
 	if err == nil {
 		// New device created — wait for it to appear and return cleanupName
 		// so the caller can close it on error.
@@ -215,6 +215,29 @@ func setupDmVerityDevice(ctx context.Context, source, mountpoint string, metadat
 
 	log.G(ctx).WithField("device", devicePath).Debug("dm-verity device already exists and verified, reusing")
 	return devicePath, "", nil
+}
+
+// Seams for tests; opening a device needs root and device-mapper.
+var (
+	dmverityOpen       = dmverity.Open
+	dmverityOpenSigned = dmverity.OpenSigned
+)
+
+// openLayerDevice opens the dm-verity device of a layer blob. A layer unpacked
+// from a signed dm-verity referrer carries the PKCS#7 signature over its root
+// hash next to the blob; it is handed to the kernel, which verifies it.
+func openLayerDevice(source, deviceName string, metadata *dmverity.DmverityMetadata) error {
+	signaturePath := dmverity.SignaturePath(source)
+	_, err := os.Stat(signaturePath)
+	switch {
+	case err == nil:
+		_, err = dmverityOpenSigned(source, deviceName, source, metadata.RootHash, metadata.HashOffset, signaturePath)
+	case errors.Is(err, os.ErrNotExist):
+		_, err = dmverityOpen(source, deviceName, source, metadata.RootHash, metadata.HashOffset, nil)
+	default:
+		err = fmt.Errorf("failed to stat dm-verity signature: %w", err)
+	}
+	return err
 }
 
 // waitForDevice polls for the device node to appear, returning an error if it

@@ -21,6 +21,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 
 	"github.com/containerd/log"
 	"github.com/google/uuid"
@@ -121,6 +125,92 @@ func Format(dataDevice, hashDevice string, opts *DmverityOptions) (string, error
 // layerBlobPath (growing the file in place) and writes the "<blob>.dmverity"
 // sidecar holding the resulting root hash and superblock offset. It is a no-op
 // if the sidecar already exists. A nil opts uses DefaultDmverityOptions.
+// WriteMetadata atomically writes the "<blob>.dmverity" metadata of a layer.
+func WriteMetadata(layerBlobPath string, metadata DmverityMetadata) error {
+	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
+	}
+	f, err := atomicfile.New(MetadataPath(layerBlobPath), 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create dm-verity metadata file: %w", err)
+	}
+	if _, err := f.Write(metadataBytes); err != nil {
+		f.Cancel()
+		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	}
+	return nil
+}
+
+// VerifyLayer checks a layer blob that carries a published dm-verity
+// superblock and hash tree at hashOffset: the superblock must cover exactly the
+// data in front of it, and the data must verify against the tree up to
+// rootHash. On a mismatch the error names the root hash computed from the data
+// and the expected one.
+func VerifyLayer(layerBlobPath string, hashOffset uint64, rootHash string) error {
+	expected, err := utils.ParseRootHash(rootHash)
+	if err != nil {
+		return fmt.Errorf("invalid root hash: %w", err)
+	}
+	f, err := os.Open(layerBlobPath)
+	if err != nil {
+		return err
+	}
+	sb, err := verity.ReadSuperblock(f, hashOffset)
+	f.Close()
+	if err != nil {
+		return fmt.Errorf("failed to read dm-verity superblock at offset %d: %w", hashOffset, err)
+	}
+	if sb.DataBlockSize == 0 || sb.DataBlocks*uint64(sb.DataBlockSize) != hashOffset {
+		return fmt.Errorf("dm-verity superblock covers %d blocks of %d bytes, the data is %d bytes",
+			sb.DataBlocks, sb.DataBlockSize, hashOffset)
+	}
+
+	params := verity.Params{HashAreaOffset: hashOffset}
+	verifyErr := verity.Verify(&params, layerBlobPath, layerBlobPath, expected)
+	if verifyErr == nil {
+		return nil
+	}
+	computed, err := dataRootHash(layerBlobPath, sb)
+	if err != nil {
+		return fmt.Errorf("dm-verity verification failed: %w (computing the data's root hash: %v)", verifyErr, err)
+	}
+	if !strings.EqualFold(computed, rootHash) {
+		return fmt.Errorf("dm-verity root hash mismatch: data has %s, signed %s", computed, strings.ToLower(rootHash))
+	}
+	return fmt.Errorf("dm-verity hash tree does not match its data for root hash %s: %w", computed, verifyErr)
+}
+
+// dataRootHash computes the root hash of the data covered by sb, building the
+// hash tree in a temporary file next to the layer blob.
+func dataRootHash(layerBlobPath string, sb *verity.Superblock) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(layerBlobPath), ".dmverity-tree-")
+	if err != nil {
+		return "", err
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	params := verity.Params{
+		HashName:      strings.TrimRight(string(sb.Algorithm[:]), "\x00"),
+		DataBlockSize: sb.DataBlockSize,
+		HashBlockSize: sb.HashBlockSize,
+		DataBlocks:    sb.DataBlocks,
+		HashType:      sb.HashType,
+		Salt:          slices.Clone(sb.Salt[:sb.SaltSize]),
+		SaltSize:      sb.SaltSize,
+		NoSuperblock:  true,
+	}
+	root, err := verity.Create(&params, layerBlobPath, tmp.Name())
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", root), nil
+}
+
 func FormatLayer(ctx context.Context, layerBlobPath string, opts *DmverityOptions) error {
 	metadataPath := MetadataPath(layerBlobPath)
 	if _, err := os.Stat(metadataPath); err == nil {
@@ -189,26 +279,8 @@ func FormatLayer(ctx context.Context, layerBlobPath string, opts *DmverityOption
 	// Save the ORIGINAL hashOffset (where the superblock is located), not the
 	// post-Format offset (which points past the superblock). Open() needs the
 	// superblock location to read device parameters.
-	metadata := DmverityMetadata{
-		RootHash:   rootHash,
-		HashOffset: hashOffset,
-	}
-	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
-	}
-	// Write the sidecar atomically (temp file, synced, renamed) so a reader never
-	// observes a partially written .dmverity.
-	f, err := atomicfile.New(metadataPath, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create dm-verity metadata file: %w", err)
-	}
-	if _, err := f.Write(metadataBytes); err != nil {
-		f.Cancel()
-		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	if err := WriteMetadata(layerBlobPath, DmverityMetadata{RootHash: rootHash, HashOffset: hashOffset}); err != nil {
+		return err
 	}
 
 	log.G(ctx).WithFields(log.Fields{
@@ -235,6 +307,35 @@ func FormatLayer(ctx context.Context, layerBlobPath string, opts *DmverityOption
 //     Uses explicitly provided parameters from opts. All dm-verity parameters must be
 //     supplied programmatically since there's no superblock to read from.
 func Open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions) (string, error) {
+	return open(dataDevice, name, hashDevice, rootHash, hashOffset, opts, "")
+}
+
+// OpenSigned opens a dm-verity device like Open and hands the kernel the PKCS#7
+// signature over the root hash at signaturePath, as required under
+// dm_verity.require_signatures=1.
+//
+// The signature reaches the kernel as a key in the calling thread's keyring,
+// so the device is opened on a goroutine locked to its OS thread. The goroutine
+// exits locked, which retires the thread together with its keyring.
+func OpenSigned(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, signaturePath string) (string, error) {
+	if signaturePath == "" {
+		return "", fmt.Errorf("signature path cannot be empty")
+	}
+	type result struct {
+		devicePath string
+		err        error
+	}
+	done := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		devicePath, err := open(dataDevice, name, hashDevice, rootHash, hashOffset, nil, signaturePath)
+		done <- result{devicePath, err}
+	}()
+	r := <-done
+	return r.devicePath, r.err
+}
+
+func open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions, signaturePath string) (string, error) {
 	if rootHash == "" {
 		return "", fmt.Errorf("rootHash cannot be empty")
 	}
@@ -280,7 +381,7 @@ func Open(dataDevice string, name string, hashDevice string, rootHash string, ha
 		hashLoopDevice = dataLoopDevice
 	}
 
-	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, "", nil)
+	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, signaturePath, nil)
 	if err != nil {
 		dataLoop.Close()
 		if hashLoop != nil {
