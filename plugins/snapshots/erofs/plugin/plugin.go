@@ -61,6 +61,16 @@ type Config struct {
 	// Linux only
 	DmverityMode string `toml:"dmverity_mode"`
 
+	// EnableDmverityReferrers makes pulls for this snapshotter fetch each image
+	// manifest's signed dm-verity referrer (artifact type
+	// application/vnd.containerd.erofs.dmverity.v1) and fail for a layer
+	// without one, and mounts no layer without the dm-verity metadata and
+	// root-hash signature stored with it. Pair it with the erofs differ's
+	// enable_dmverity_referrers. It needs dm-verity: dmverity_mode must not be
+	// "off".
+	// Linux only
+	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
+
 	// LayerContentCaches lists directories of pre-converted, diffID-keyed erofs
 	// layer blobs. A layer found in one of them is mounted from that directory,
 	// in both sequential and parallel unpack modes. The directories are
@@ -146,6 +156,10 @@ func init() {
 
 			ic.Meta.Exports[plugins.SnapshotterRootDir] = root
 			ic.Meta.Capabilities = append(ic.Meta.Capabilities, snapshots.RebaseCap)
+			if config.EnableDmverityReferrers {
+				opts = append(opts, erofs.WithDmverityReferrers())
+				ic.Meta.Capabilities = append(ic.Meta.Capabilities, plugins.CapabilityDmverityReferrers)
+			}
 			return erofs.NewSnapshotter(root, opts...)
 		},
 	})

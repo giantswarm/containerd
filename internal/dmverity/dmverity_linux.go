@@ -23,9 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
 
 	"github.com/containerd/log"
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/atomicfile"
@@ -123,6 +128,91 @@ func Format(dataDevice, hashDevice string, opts *DmverityOptions) (string, error
 // layerBlobPath (growing the file in place) and writes the "<blob>.dmverity"
 // sidecar holding the resulting root hash and superblock offset. It is a no-op
 // if the sidecar already exists. A nil opts uses DefaultDmverityOptions.
+// WriteMetadata atomically writes the "<blob>.dmverity" metadata of a layer.
+func WriteMetadata(layerBlobPath string, metadata DmverityMetadata) error {
+	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
+	}
+	f, err := atomicfile.New(MetadataPath(layerBlobPath), 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create dm-verity metadata file: %w", err)
+	}
+	if _, err := f.Write(metadataBytes); err != nil {
+		f.Cancel()
+		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	}
+	return nil
+}
+
+// VerifyLayer checks a layer blob that carries a published dm-verity
+// superblock and hash tree at hashOffset: the superblock must pass the checks
+// opening the device applies (block sizes, hash type and algorithm, salt size)
+// and cover exactly the data in front of it, and the data must verify against
+// the tree up to rootHash. On a mismatch the error names the root hash computed
+// from the data and the expected one.
+func VerifyLayer(layerBlobPath string, hashOffset uint64, rootHash string) error {
+	expected, err := utils.ParseRootHash(rootHash)
+	if err != nil {
+		return fmt.Errorf("invalid root hash: %w", err)
+	}
+	// The superblock is published data: InitParams reads it and checks every
+	// field before anything sizes or indexes by it, as the device's open does.
+	sb := verity.Params{HashAreaOffset: hashOffset}
+	if err := verity.InitParams(&sb, layerBlobPath, layerBlobPath); err != nil {
+		return fmt.Errorf("invalid dm-verity superblock at offset %d: %w", hashOffset, err)
+	}
+	if hashOffset%uint64(sb.DataBlockSize) != 0 || sb.DataBlocks != hashOffset/uint64(sb.DataBlockSize) {
+		return fmt.Errorf("dm-verity superblock covers %d blocks of %d bytes, the data is %d bytes",
+			sb.DataBlocks, sb.DataBlockSize, hashOffset)
+	}
+
+	params := verity.Params{HashAreaOffset: hashOffset}
+	verifyErr := verity.Verify(&params, layerBlobPath, layerBlobPath, expected)
+	if verifyErr == nil {
+		return nil
+	}
+	computed, err := dataRootHash(layerBlobPath, sb)
+	if err != nil {
+		return fmt.Errorf("dm-verity verification failed: %w (computing the data's root hash: %v)", verifyErr, err)
+	}
+	if !strings.EqualFold(computed, rootHash) {
+		return fmt.Errorf("dm-verity root hash mismatch: data has %s, signed %s", computed, strings.ToLower(rootHash))
+	}
+	return fmt.Errorf("dm-verity hash tree does not match its data for root hash %s: %w", computed, verifyErr)
+}
+
+// dataRootHash computes the root hash of the data with the dm-verity
+// parameters of a checked superblock, building the hash tree in a temporary
+// file next to the layer blob.
+func dataRootHash(layerBlobPath string, sb verity.Params) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(layerBlobPath), ".dmverity-tree-")
+	if err != nil {
+		return "", err
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+
+	params := verity.Params{
+		HashName:      sb.HashName,
+		DataBlockSize: sb.DataBlockSize,
+		HashBlockSize: sb.HashBlockSize,
+		DataBlocks:    sb.DataBlocks,
+		HashType:      sb.HashType,
+		Salt:          sb.Salt,
+		SaltSize:      sb.SaltSize,
+		NoSuperblock:  true,
+	}
+	root, err := verity.Create(&params, layerBlobPath, tmp.Name())
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(root), nil
+}
+
 func FormatLayer(ctx context.Context, layerBlobPath string, opts *DmverityOptions) error {
 	metadataPath := MetadataPath(layerBlobPath)
 	if _, err := os.Stat(metadataPath); err == nil {
@@ -191,26 +281,8 @@ func FormatLayer(ctx context.Context, layerBlobPath string, opts *DmverityOption
 	// Save the ORIGINAL hashOffset (where the superblock is located), not the
 	// post-Format offset (which points past the superblock). Open() needs the
 	// superblock location to read device parameters.
-	metadata := DmverityMetadata{
-		RootHash:   rootHash,
-		HashOffset: hashOffset,
-	}
-	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal dm-verity metadata: %w", err)
-	}
-	// Write the sidecar atomically (temp file, synced, renamed) so a reader never
-	// observes a partially written .dmverity.
-	f, err := atomicfile.New(metadataPath, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create dm-verity metadata file: %w", err)
-	}
-	if _, err := f.Write(metadataBytes); err != nil {
-		f.Cancel()
-		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to write dm-verity metadata: %w", err)
+	if err := WriteMetadata(layerBlobPath, DmverityMetadata{RootHash: rootHash, HashOffset: hashOffset}); err != nil {
+		return err
 	}
 
 	log.G(ctx).WithFields(log.Fields{
@@ -237,6 +309,35 @@ func FormatLayer(ctx context.Context, layerBlobPath string, opts *DmverityOption
 //     Uses explicitly provided parameters from opts. All dm-verity parameters must be
 //     supplied programmatically since there's no superblock to read from.
 func Open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions) (string, error) {
+	return open(dataDevice, name, hashDevice, rootHash, hashOffset, opts, "")
+}
+
+// OpenSigned opens a dm-verity device like Open and hands the kernel the PKCS#7
+// signature over the root hash at signaturePath, as required under
+// dm_verity.require_signatures=1.
+//
+// The signature reaches the kernel as a key in the calling thread's keyring,
+// so the device is opened on a goroutine locked to its OS thread. The goroutine
+// exits locked, which retires the thread together with its keyring.
+func OpenSigned(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, signaturePath string) (string, error) {
+	if signaturePath == "" {
+		return "", errors.New("signature path cannot be empty")
+	}
+	type result struct {
+		devicePath string
+		err        error
+	}
+	done := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		devicePath, err := open(dataDevice, name, hashDevice, rootHash, hashOffset, nil, signaturePath)
+		done <- result{devicePath, err}
+	}()
+	r := <-done
+	return r.devicePath, r.err
+}
+
+func open(dataDevice string, name string, hashDevice string, rootHash string, hashOffset uint64, opts *DmverityOptions, signaturePath string) (string, error) {
 	if rootHash == "" {
 		return "", errors.New("rootHash cannot be empty")
 	}
@@ -282,7 +383,7 @@ func Open(dataDevice string, name string, hashDevice string, rootHash string, ha
 		hashLoopDevice = dataLoopDevice
 	}
 
-	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, "", nil)
+	devicePath, err := verity.Open(&params, name, dataLoopDevice, hashLoopDevice, rootDigest, signaturePath, nil)
 	if err != nil {
 		dataLoop.Close()
 		if hashLoop != nil {
@@ -305,6 +406,53 @@ func Close(name string) error {
 		return fmt.Errorf("failed to close dm-verity device: %w", err)
 	}
 	return nil
+}
+
+// Seams for tests; opening and removing a device needs root and device-mapper.
+var (
+	openSigned  = OpenSigned
+	verityClose = verity.Close
+)
+
+// VerifySignature has the kernel verify the PKCS#7 signature at signaturePath
+// over rootHash of the layer blob at layerBlobPath, which carries its dm-verity
+// superblock and hash tree at hashOffset. It opens the blob's dm-verity device
+// as OpenSigned does, under name, and closes it again. The kernel checks the
+// signature when the device's table is loaded and refuses the device if no
+// trusted key verifies it; the error then carries the kernel's reason, such as
+// "required key not available" for a signer it does not trust. No device is
+// left behind either way.
+func VerifySignature(layerBlobPath string, name string, rootHash string, hashOffset uint64, signaturePath string) error {
+	_, err := openSigned(layerBlobPath, name, layerBlobPath, rootHash, hashOffset, signaturePath)
+	// The library removes a device the kernel refused; removing it here also
+	// covers a removal that failed there.
+	removeErr := removeDevice(name)
+	switch {
+	case err != nil && removeErr != nil:
+		return fmt.Errorf("%w (%w)", err, removeErr)
+	case err != nil:
+		return err
+	default:
+		return removeErr
+	}
+}
+
+// removeDevice removes the device-mapper device name if it exists. udev probes
+// a device once it is resumed, which keeps it open for a moment, so a busy
+// device is retried for up to a second.
+func removeDevice(name string) error {
+	var err error
+	for range 100 {
+		err = verityClose(name)
+		if err == nil || errors.Is(err, unix.ENXIO) {
+			return nil
+		}
+		if !errors.Is(err, unix.EBUSY) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("failed to close dm-verity device %q: %w", name, err)
 }
 
 // VerifyDevice ensures an existing dm-verity device matches the expected metadata and is healthy.

@@ -299,6 +299,82 @@ automatically reads all parameters from the superblock, ensuring that any corrup
 or tampering will be detected at read time. The dm-verity device is then mounted as
 the backing layer in the OverlayFS stack
 
+### Signed dm-verity root hashes from referrers
+
+A kernel booted with `dm_verity.require_signatures=1` only opens a dm-verity
+device whose root hash comes with a PKCS#7 signature it trusts. The node cannot
+sign a root hash it computes, so the image publisher signs each layer's root
+hash and attaches the signature, the EROFS tar index and the dm-verity hash tree
+to the image as an OCI referrer:
+
+- One referrer per platform image manifest (its `subject`), artifact type
+  `application/vnd.containerd.erofs.dmverity.v1`. If several exist, the one with
+  the newest `org.opencontainers.image.created` annotation wins; ties go to the
+  lowest digest.
+- For each image layer, three blobs annotated with
+  `io.containerd.erofs.v1/dmverity.source-layer-digest: <layer digest>`:
+  - `application/vnd.containerd.erofs.metadata.v1`: the EROFS tar index
+    (`mkfs.erofs --tar=i`) of the layer's uncompressed tar;
+  - `application/vnd.containerd.erofs.dmverity.merkle-tree.v1`: the dm-verity
+    superblock and hash tree over the index followed by the whole uncompressed
+    tar, zero-padded to 512 bytes;
+  - `application/vnd.containerd.erofs.dmverity.layer-signature.v1+pkcs7`: the
+    detached PKCS#7 signature over the lowercase hex root hash, annotated with
+    `io.containerd.erofs.v1/dmverity.root-hash: <hex>`.
+
+```toml
+[plugins."io.containerd.differ.v1.erofs"]
+  enable_tar_index = true
+  enable_dmverity = true
+  enable_dmverity_referrers = true
+
+[plugins."io.containerd.snapshotter.v1.erofs"]
+  dmverity_mode = "on"
+  enable_dmverity_referrers = true
+```
+
+With `enable_dmverity_referrers` set on the snapshotter, a pull that unpacks
+into it fetches each manifest's referrer with the pull's own resolver and
+credentials, and fails for a layer that has no signature, index or hash tree,
+naming the layer. The differ then builds the layer as the published index, the
+whole uncompressed tar and the published hash tree, without running
+`mkfs.erofs`. It checks once that the data verifies against the tree and that
+the tree's root hash is the signed one, and otherwise fails the pull with the
+layer digest and both root hashes. The signature is stored next to the layer as
+`layer.erofs.sig`, and the snapshot records the root hash and the signature
+digest in its labels. When the layer is mounted, the signature is handed to
+dm-verity through the kernel keyring of a dedicated, locked OS thread.
+
+Whether the kernel trusts the signature is checked before the snapshot is
+committed: the differ opens the layer's dm-verity device with the signature the
+same way, then closes it again. This costs one device setup and removal per
+unpacked layer and reads no layer data. A signature the kernel refuses, such as
+one by a key that no trusted keyring holds, fails the pull with the layer digest
+and the kernel's reason, and the layer does not become a snapshot.
+
+Snapshots stay keyed by chain ID. A layer that another image already unpacked
+reuses that snapshot if it carries a signed identity, even when this image's
+referrer signs the layer differently: with another key, again with a key whose
+signatures are not deterministic, or over another root hash, because its index
+was built by another `mkfs.erofs` or the same tar was compressed differently.
+The snapshot holds the same uncompressed layer on the same parent chain,
+together with the index, hash tree and signature it was unpacked with. The
+kernel accepted that signature when the layer was unpacked, and checks it
+against those exact device bytes at every mount, so an image signed by a key
+the node does not trust leaves no snapshot that would fail the images sharing
+the layer.
+The referrer of every image still has to cover each of its layers, whether or
+not the layer is unpacked already. A snapshot without a signed identity is not
+reused: the pull fails, naming the layer.
+
+Signed layers are then required: the differ refuses native EROFS layers
+(`application/vnd.erofs.layer.v1`, compressed or not), which come with no signed
+target, and the snapshotter mounts no layer without its stored dm-verity
+metadata and signature, whatever made it (a snapshot unpacked before the option
+was enabled, a layer content cache entry), and no merged fsmeta, which would
+address the layers without dm-verity. The snapshotter's option cannot be
+combined with `dmverity_mode = "off"`.
+
 ## How It Works
 
 For each layer, the EROFS snapshotter prepares a directory containing the

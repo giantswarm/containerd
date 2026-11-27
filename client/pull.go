@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/semaphore"
@@ -29,7 +30,9 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/core/unpack"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 )
@@ -116,6 +119,17 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 			ApplyOpts:               uconfig.ApplyOpts,
 			SnapshotterCapabilities: snCapabilities,
 		}
+		var dmverityWrapper func(images.Handler) images.Handler
+		if slices.Contains(snCapabilities, plugins.CapabilityDmverityReferrers) {
+			// Layers for this snapshotter are unpacked from signed dm-verity
+			// referrers, fetched with the pull's own resolver.
+			fetcher, err := pullCtx.Resolver.Fetcher(ctx, ref)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get fetcher for %q: %w", ref, err)
+			}
+			platform.ApplyOpts = append(slices.Clone(platform.ApplyOpts), snpkg.WithDmverityReferrers())
+			dmverityWrapper = snpkg.AppendDmverityReferrersHandlerWrapper(fetcher, c.ContentStore())
+		}
 		uopts := []unpack.UnpackerOpt{unpack.WithUnpackPlatform(platform)}
 		if uconfig.FetchAllContent {
 			uopts = append(uopts, unpack.WithFetchAllContent())
@@ -139,10 +153,13 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}()
 		wrapper := pullCtx.HandlerWrapper
 		pullCtx.HandlerWrapper = func(h images.Handler) images.Handler {
-			if wrapper == nil {
-				return unpacker.Unpack(h)
+			if wrapper != nil {
+				h = wrapper(h)
 			}
-			return unpacker.Unpack(wrapper(h))
+			if dmverityWrapper != nil {
+				h = dmverityWrapper(h)
+			}
+			return unpacker.Unpack(h)
 		}
 	}
 

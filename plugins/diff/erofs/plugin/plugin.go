@@ -49,6 +49,13 @@ type Config struct {
 	// EnableDmverity enables dm-verity formatting for EROFS layers
 	// Linux only
 	EnableDmverity bool `toml:"enable_dmverity"`
+
+	// EnableDmverityReferrers builds each tar layer from the EROFS tar index,
+	// dm-verity hash tree and root-hash signature published in the image's
+	// application/vnd.containerd.erofs.dmverity.v1 referrer. Every tar layer
+	// must be signed. mkfs.erofs is not needed. Pair it with the erofs
+	// snapshotter's enable_dmverity_referrers, which fetches the referrers.
+	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
 }
 
 // useMkfs reports whether the differ builds layers with mkfs.erofs.
@@ -109,6 +116,13 @@ func init() {
 					return nil, fmt.Errorf("dm-verity is not supported on this system (dm_verity module not loaded): %w", plugin.ErrSkipPlugin)
 				}
 				opts = append(opts, erofs.WithDmverity())
+			}
+			if config.EnableDmverityReferrers {
+				supported, err := dmverity.IsSupported()
+				if err != nil || !supported {
+					return nil, fmt.Errorf("enable_dmverity_referrers needs dm-verity, which is not supported on this system: %v: %w", err, plugin.ErrSkipPlugin)
+				}
+				opts = append(opts, erofs.WithDmverityReferrers())
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil

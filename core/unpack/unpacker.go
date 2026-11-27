@@ -45,6 +45,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/cleanup"
 	"github.com/containerd/containerd/v2/internal/kmutex"
 	"github.com/containerd/containerd/v2/pkg/labels"
+	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 )
 
@@ -515,6 +516,9 @@ func (u *Unpacker) unpack(
 						// Try again, this should be rare, log it
 						log.G(ctx).WithField("key", key).WithField("chainid", chainID).Debug("extraction snapshot already exists, chain id not found")
 					} else {
+						if err := snpkg.ValidateDmveritySnapshot(snInfo.Labels, snapshotLabels); err != nil {
+							return nil, fmt.Errorf("layer %s: %w", desc.Digest, err)
+						}
 						log.G(ctx).Debugf("snapshot %s with chainID %s already exists, skip extraction of blob %q", snInfo.Name, chainID, desc.Digest)
 						// no need to handle, snapshot now found with chain id
 						return nil, nil
@@ -560,6 +564,11 @@ func (u *Unpacker) unpack(
 			if err := sn.Commit(ctx, chainID, key, opts...); err != nil {
 				cleanup.Do(ctx, abort)
 				if errdefs.IsAlreadyExists(err) {
+					if snInfo, err := sn.Stat(ctx, chainID); err == nil {
+						if err := snpkg.ValidateDmveritySnapshot(snInfo.Labels, snapshotLabels); err != nil {
+							return fmt.Errorf("layer %s: %w", desc.Digest, err)
+						}
+					}
 					return nil
 				}
 				return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
