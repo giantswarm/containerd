@@ -3,5 +3,6 @@
 // would diverge from the pin, and every re-pin would have to carry or revert
 // it. Dependencies move when the line is re-pinned.
 {
+  reviewers: ['teemow'],
   enabled: false,
 }
