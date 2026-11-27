@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/errdefs"
 	goerofs "github.com/erofs/go-erofs"
 	"github.com/stretchr/testify/assert"
@@ -57,4 +58,37 @@ func TestHandleMountUnsupportedCompression(t *testing.T) {
 	assert.ErrorContains(t, err, "unsupported incompatible feature 0x2")
 	require.ErrorIs(t, err, goerofs.ErrNotImplemented)
 	assert.ErrorIs(t, err, errdefs.ErrNotImplemented)
+}
+
+func TestHandleMountDmverity(t *testing.T) {
+	// The blob and its devices are not opened: a layer verified by dm-verity
+	// is left to the mount handler, whatever its contents.
+	dir := t.TempDir()
+	layerPath := filepath.Join(dir, "layer.erofs")
+	devicePath := filepath.Join(dir, "device-0.blob")
+
+	for _, tc := range []struct {
+		name    string
+		options []string
+	}{
+		{
+			name:    "layer",
+			options: []string{"ro", "loop", dmverity.MountOption + layerPath + ".dmverity"},
+		},
+		{
+			name:    "device",
+			options: []string{"ro", "loop", "device=" + devicePath, dmverity.DeviceMountOption + "0=" + devicePath + ".dmverity"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			view, err := handleMount(mount.Mount{
+				Type:    "erofs",
+				Source:  layerPath,
+				Options: tc.options,
+			})
+			require.Nil(t, view)
+			require.ErrorIs(t, err, errdefs.ErrNotImplemented)
+			assert.NotErrorIs(t, err, os.ErrNotExist)
+		})
+	}
 }

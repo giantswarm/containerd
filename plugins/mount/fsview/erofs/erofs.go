@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsview"
 	"github.com/containerd/errdefs"
 	"github.com/erofs/go-erofs"
@@ -41,6 +42,15 @@ func init() {
 func handleMount(m mount.Mount) (fsview.View, error) {
 	if m.Type != "erofs" {
 		return nil, errdefs.ErrNotImplemented
+	}
+
+	for _, opt := range m.Options {
+		if strings.HasPrefix(opt, dmverity.MountOption) || strings.HasPrefix(opt, dmverity.DeviceMountOption) {
+			// Reading the blob or its devices directly would skip dm-verity's
+			// check of every block read. Leave the layer to the mount handler,
+			// which reads them through their dm-verity devices.
+			return nil, fmt.Errorf("erofs layer %s is verified by dm-verity: %w", m.Source, errdefs.ErrNotImplemented)
+		}
 	}
 
 	f, err := os.Open(m.Source)

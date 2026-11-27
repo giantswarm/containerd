@@ -18,9 +18,11 @@ package fsview_test
 
 import (
 	"io/fs"
+	"path/filepath"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/dmverity"
 	"github.com/containerd/containerd/v2/internal/fsview"
 	"github.com/containerd/errdefs"
 	"github.com/stretchr/testify/assert"
@@ -158,6 +160,30 @@ func TestFormatMountUnsupportedType(t *testing.T) {
 			Source: "overlay",
 			Options: []string{
 				"lowerdir={{ mount 0 }}",
+			},
+		},
+	}
+
+	_, err := fsview.FSMounts(mounts)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errdefs.ErrNotImplemented)
+}
+
+// TestFormatMountDmverityErofs tests that an overlay over an erofs layer
+// verified by dm-verity is not read directly, so callers mount it instead.
+func TestFormatMountDmverityErofs(t *testing.T) {
+	layerPath := filepath.Join(t.TempDir(), "layer.erofs")
+	mounts := []mount.Mount{
+		{
+			Source:  layerPath,
+			Type:    "erofs",
+			Options: []string{"ro", "loop", dmverity.MountOption + layerPath + ".dmverity"},
+		},
+		{
+			Type:   "format/mkdir/overlay",
+			Source: "overlay",
+			Options: []string{
+				"lowerdir={{ overlay 0 0 }}",
 			},
 		},
 	}
