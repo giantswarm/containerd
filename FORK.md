@@ -33,7 +33,7 @@ build, the release tags and the artifact's `io.giantswarm.upstream.version` anno
 ## Carried patches
 
 Everything on `giantswarm` that is neither in the pin nor the fork's own infrastructure has a ledger file of its own in
-[`fork/`](fork/) (format in [`fork/README.md`](fork/README.md)); the directory is the index. None yet.
+[`fork/`](fork/) (format in [`fork/README.md`](fork/README.md)); the directory is the index.
 
 The fork's own infrastructure, ours to keep and never sent upstream:
 
