@@ -61,10 +61,15 @@ A re-pin moves the line to a newer upstream release, e.g. when a release carries
 
 ## Releases
 
-Every push to `giantswarm` is a release: `tag-release` puts the next tag **`v<pin>-gs.<N>`** (`v2.4.2-gs.1`,
-`v2.4.2-gs.2`, …) and its GitHub Release on the pushed commit; `N` counts the releases of that pin. A merged carried
-patch therefore ships as the next revision of the pin; a re-pin starts at `-gs.1`. Do not push other tags: upstream's
-`v*` tags are not mirrored here.
+Every push to `giantswarm` is a release: the `tag-release` workflow puts the next tag **`v<pin>-gs.<N>`**
+(`v2.4.2-gs.1`, `v2.4.2-gs.2`, …) and its GitHub Release on the pushed commit; `N` counts the releases of that pin. A
+merged carried patch therefore ships as the next revision of the pin; a re-pin starts at `-gs.1`.
+
+- **Where a release comes from**: a commit of `giantswarm`, nothing else. The publish job checks that the tagged
+  commit is an ancestor of `giantswarm` and fails naming the tag and the commit otherwise.
+- **Who tags**: `tag-release` alone, as GitHub Actions on a push to `giantswarm`. Nobody pushes a `v*-gs.*` tag by
+  hand, and upstream's `v*` tags are not mirrored here. No ruleset enforces this yet: the repository's declaration in
+  giantswarm/github cannot express a tag ruleset, so the provenance check above is the guard.
 
 ## Publishing
 
@@ -75,8 +80,7 @@ modules) and pushes them to gsoci, signed with the organisation's CircleCI ident
 | | |
 |---|---|
 | Repository | `gsoci.azurecr.io/giantswarm/containerd` |
-| Release tag | `v<pin>-gs.<N>`, the git tag itself (`v2.4.2-gs.1`): pushed only by a tag build, as exactly `CIRCLE_TAG` |
-| Dev tag | `v<pin>-dev.<the first 12 characters of CIRCLE_SHA1>`, for every push to a branch of the line but `main`: pushed only by a branch build, so no branch can publish a release tag |
+| Tag | `v<pin>-gs.<N>`, the git tag itself (`v2.4.2-gs.1`), pushed only by the tag's own build as exactly `CIRCLE_TAG`; releases only, no dev builds |
 | Manifest | OCI image manifest, `artifactType` `application/vnd.giantswarm.containerd.binaries.v1`, empty config |
 | Layer | one, `application/vnd.oci.image.layer.v1.tar+gzip`, titled `containerd-linux-amd64.tar.gz`: `bin/containerd`, `bin/containerd-shim-runc-v2`, `bin/ctr` (owner 0:0, mtime the commit's) |
 | Annotations | `org.opencontainers.image.version`, `.revision`, `.source`; `io.giantswarm.upstream.version` (the pin); `io.giantswarm.platform` (`linux/amd64`) |
@@ -87,11 +91,13 @@ tar -xzf containerd-linux-amd64.tar.gz                             # bin/contain
 bin/containerd --version                                           # containerd github.com/containerd/containerd/v2 v2.4.2-gs.1 <commit>
 ```
 
-**Published tags are immutable.** The publish jobs work the tag out from CircleCI's own variables, check that the
-binaries were built under it, and refuse a tag that already exists in gsoci; what they push is what they sign
-(`<repository>@<digest>`). A release is never re-published: a fix is the next revision. The registry credentials come
-from the `architect` context, which CircleCI hands to builds of this repository's own branches and tags only, never
-to a build of a pull request from a fork.
+**Published tags are immutable.** The publish job takes the tag from CircleCI's own `CIRCLE_TAG`, checks that the
+binaries were built under it, and refuses a tag that already exists in gsoci; what it pushes is what it signs
+(`<repository>@<digest>`). A release is never re-published: a fix is the next revision.
+
+**Branches never publish.** A push to a branch runs the build alone; only the release tag's `publish-release` job gets
+the `architect` context with the registry credentials and the signing identity. The pipeline is triggered by pushes
+to this repository only, so a pull request from a fork never builds here.
 
 gsoci is the only registry: nothing of the line is published to ghcr.io or as a GitHub Release asset.
 
@@ -109,6 +115,6 @@ gsoci is the only registry: nothing of the line is published to ghcr.io or as a 
 - **Merge methods**: a carried patch is rebase-merged (one commit per patch); fork-infrastructure changes are
   squash-merged with a Conventional Commits title. Every merge is a release ("Releases").
 - **Builds**: `make STATIC=1 bin/containerd bin/containerd-shim-runc-v2 bin/ctr` builds what the line publishes;
-  CircleCI builds and publishes every branch's push as a dev build, so a pull request's artifact can be proven on a
-  node before it merges.
+  CircleCI builds every branch's push and publishes nothing from it. A change is proven on a node with a local build
+  before it merges.
 - **Dependencies** move with the pin: Renovate and Dependabot are off on the line.

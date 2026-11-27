@@ -3,16 +3,14 @@
 #
 # Builds containerd, containerd-shim-runc-v2 and ctr for linux/amd64 as static
 # binaries with containerd's own Makefile (STATIC=1, upstream's build tags and
-# vendored modules) and publishes them to gsoci.azurecr.io/giantswarm/containerd
-# as one OCI artifact: a single tar.gz layer holding bin/<binary>, signed with
-# the organisation's CircleCI identity (architect/cosign-sign-verify).
-#
-# The artifact's tag is worked out in the publish jobs from CircleCI's own
-# variables, never taken from the workspace: publish-release runs on tag
-# builds only and pushes exactly CIRCLE_TAG, which must read v<X.Y.Z>-gs.<N>;
-# publish-dev runs on branch builds only and pushes v<pin>-dev.<the first 12
-# characters of CIRCLE_SHA1>, so no branch can name a release. A tag that
-# already exists in gsoci is refused: published artifacts are immutable.
+# vendored modules) on every push to a branch of the line but `main`, and on
+# every release tag. Only a release tag publishes: publish-release pushes the
+# binaries to gsoci.azurecr.io/giantswarm/containerd as one OCI artifact (a
+# single tar.gz layer holding bin/<binary>) under exactly CIRCLE_TAG, which
+# must read v<X.Y.Z>-gs.<N> and sit on a commit of `giantswarm`, refuses a tag
+# gsoci already has (published artifacts are immutable), and signs what it
+# pushed with the organisation's CircleCI identity. No branch build gets the
+# `architect` context, pushes or signs anything.
 version: 2.1
 
 orbs:
@@ -37,8 +35,7 @@ jobs:
             else
               .github/scripts/line-version.sh dev "${CIRCLE_SHA1}" > .build_version
             fi
-            .github/scripts/line-version.sh pin > .build_pin
-            echo "version $(cat .build_version), pin $(cat .build_pin)"
+            echo "version $(cat .build_version)"
       - run:
           name: Build the static binaries
           command: |
@@ -65,66 +62,43 @@ jobs:
           root: .
           paths:
             - .build_version
-            - .build_pin
             - containerd-linux-amd64.tar.gz
 
-  publish:
-    parameters:
-      kind:
-        type: enum
-        enum: [release, dev]
+  publish-release:
     executor: architect/architect
     resource_class: small
     environment:
       REGISTRY: gsoci.azurecr.io/giantswarm/containerd
     steps:
+      - checkout
       - attach_workspace:
           at: .
       - run:
-          name: Work out the tag
-          environment:
-            KIND: << parameters.kind >>
+          name: Check the release's provenance
           command: |
             set -o errexit -o nounset -o pipefail
-            case "${KIND}" in
-            release)
-              tag="${CIRCLE_TAG:-}"
-              if ! printf '%s\n' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-gs\.[0-9]+$'; then
-                echo "ERROR: a release publishes a tag build of v<X.Y.Z>-gs.<N> only, not '${tag}'" >&2
-                exit 1
-              fi
-              ;;
-            dev)
-              if [ -n "${CIRCLE_TAG:-}" ]; then
-                echo "ERROR: a dev build publishes branch builds only, not the tag ${CIRCLE_TAG}" >&2
-                exit 1
-              fi
-              # The pin is the one part the tree decides; its shape is checked,
-              # and the commit part is CircleCI's, so the tag cannot read -gs.
-              pin=$(cat .build_pin)
-              if ! printf '%s\n' "${pin}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-                echo "ERROR: '${pin}' is not an upstream release version" >&2
-                exit 1
-              fi
-              tag="${pin}-dev.$(printf '%s' "${CIRCLE_SHA1}" | cut -c1-12)"
-              if ! printf '%s\n' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9a-f]{12}$'; then
-                echo "ERROR: '${tag}' is not a dev tag of the commit" >&2
-                exit 1
-              fi
-              ;;
-            esac
+            tag="${CIRCLE_TAG:-}"
+            if ! printf '%s\n' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-gs\.[0-9]+$'; then
+              echo "ERROR: a release publishes a tag build of v<X.Y.Z>-gs.<N> only, not '${tag}'" >&2
+              exit 1
+            fi
+            # A release is a commit of the line, never of another branch.
+            git fetch --quiet origin +refs/heads/giantswarm:refs/remotes/origin/giantswarm
+            if ! git merge-base --is-ancestor "${CIRCLE_SHA1}" origin/giantswarm; then
+              echo "ERROR: tag ${tag} is on ${CIRCLE_SHA1}, which is not a commit of giantswarm" >&2
+              exit 1
+            fi
             # The binaries carry the version they are published under.
             if [ "$(cat .build_version)" != "${tag}" ]; then
               echo "ERROR: the binaries were built as $(cat .build_version), the tag is ${tag}" >&2
               exit 1
             fi
-            echo "${tag}" > .publish_tag
-            echo "publishing ${REGISTRY}:${tag}"
+            echo "publishing ${REGISTRY}:${tag} from ${CIRCLE_SHA1}"
       - run:
           name: Push the OCI artifact
           command: |
             set -o errexit -o nounset -o pipefail
-            tag=$(cat .publish_tag)
+            tag="${CIRCLE_TAG}"
             ref="${REGISTRY}:${tag}"
             # oras writes ~/.docker/config.json, which cosign reads as well.
             printf '%s' "${ACR_GSOCI_PASSWORD}" | oras login gsoci.azurecr.io --username "${ACR_GSOCI_USERNAME}" --password-stdin
@@ -168,9 +142,8 @@ workflows:
               ignore: main
             tags:
               only: /^v[0-9]+\.[0-9]+\.[0-9]+-gs\.[0-9]+$/
-      - publish:
-          name: publish-release
-          kind: release
+      # Tag builds only: the one job with the architect context.
+      - publish-release:
           context: architect
           requires:
             - build
@@ -179,12 +152,3 @@ workflows:
               ignore: /.*/
             tags:
               only: /^v[0-9]+\.[0-9]+\.[0-9]+-gs\.[0-9]+$/
-      - publish:
-          name: publish-dev
-          kind: dev
-          context: architect
-          requires:
-            - build
-          filters:
-            branches:
-              ignore: main

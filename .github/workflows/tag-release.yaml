@@ -1,0 +1,56 @@
+# Fork (giantswarm/containerd): ours to keep (FORK.md, "Releases").
+#
+# Every push to `giantswarm` is a release of the line: the next tag
+# v<pin>-gs.<N> and its GitHub Release on the pushed commit, created in one
+# API call. The tag starts CircleCI's pipeline, which publishes the release to
+# gsoci; nothing here builds or publishes. A commit that already carries a
+# release tag of the pin gets no second one. GITHUB_TOKEN is enough: no GitHub
+# Actions workflow of the line listens on tags, and CircleCI receives the push
+# through its GitHub App.
+name: Tag the release
+
+on:
+  push:
+    branches:
+      - giantswarm
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    if: github.repository == 'giantswarm/containerd'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o errexit -o nounset -o pipefail
+          pin=$(.github/scripts/line-version.sh pin)
+          released=$(git tag --points-at "${GITHUB_SHA}" --list "${pin}-gs.*")
+          if [ -n "${released}" ]; then
+            echo "${GITHUB_SHA} is already released as ${released}"
+            exit 0
+          fi
+          n=$(git tag --list "${pin}-gs.*" | sed "s/^${pin}-gs\.//" | { grep -E '^[0-9]+$' || true; } | sort -n | tail -1)
+          tag="${pin}-gs.$(( ${n:-0} + 1 ))"
+          .github/scripts/line-version.sh "${tag}" >/dev/null
+          {
+            echo "containerd ${pin} (upstream release [${pin}](https://github.com/containerd/containerd/releases/tag/${pin})) with the line's carried patches, revision ${tag##*-gs.}."
+            echo
+            echo "Published as \`gsoci.azurecr.io/giantswarm/containerd:${tag}\` (FORK.md, \"Publishing\")."
+            echo
+            echo "Carried patches: the ledger in [\`fork/\`](https://github.com/${GITHUB_REPOSITORY}/tree/${tag}/fork)."
+          } > notes.md
+          gh release create "${tag}" --repo "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}" \
+            --title "${tag}" --notes-file notes.md
+          echo "released ${GITHUB_SHA} as ${tag}"
