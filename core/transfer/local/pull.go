@@ -19,6 +19,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/core/unpack"
 	"github.com/containerd/containerd/v2/defaults"
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
+	"github.com/containerd/containerd/v2/plugins"
 )
 
 func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetcher, is transfer.ImageStorer, tops *transfer.Config) error {
@@ -194,6 +196,7 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 		if len(unpacks) > 0 {
 			uopts := []unpack.UnpackerOpt{}
 			enableRemoteSnapshotAnnotations := false
+			enableDmverityReferrers := false
 			// Only unpack if requested unpackconfig matches default/supported unpackconfigs
 			for _, u := range unpacks {
 				matched, mu := getSupportedPlatform(ctx, u, ts.config.UnpackPlatforms)
@@ -203,6 +206,10 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 					}
 					if progressTracker != nil {
 						mu.ApplyOpts = append(mu.ApplyOpts, diff.WithProgress(progressTracker.ExtractProgress))
+					}
+					if slices.Contains(mu.SnapshotterCapabilities, plugins.CapabilityDmverityReferrers) {
+						enableDmverityReferrers = true
+						mu.ApplyOpts = append(mu.ApplyOpts, snpkg.WithDmverityReferrers())
 					}
 					uopts = append(uopts, unpack.WithUnpackPlatform(mu))
 				} else {
@@ -223,6 +230,10 @@ func (ts *localTransferService) pull(ctx context.Context, ir transfer.ImageFetch
 
 			if enableRemoteSnapshotAnnotations {
 				handler = snpkg.AppendInfoHandlerWrapper(name)(handler)
+			}
+
+			if enableDmverityReferrers {
+				handler = snpkg.AppendDmverityReferrersHandlerWrapper(fetcher, ts.content)(handler)
 			}
 
 			unpacker, err = unpack.NewUnpacker(ctx, ts.content, uopts...)

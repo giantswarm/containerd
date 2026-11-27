@@ -111,3 +111,10 @@ const (
 const (
 	SnapshotterRootDir = "root"
 )
+
+const (
+	// CapabilityDmverityReferrers is advertised by a snapshotter whose layers
+	// are unpacked from signed dm-verity referrers: pulls for it fetch each
+	// image manifest's application/vnd.containerd.erofs.dmverity.v1 referrer.
+	CapabilityDmverityReferrers = "dmverity-referrers"
+)

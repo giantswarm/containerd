@@ -42,6 +42,13 @@ type Config struct {
 	// EnableDmverity enables dm-verity formatting for EROFS layers
 	// Linux only
 	EnableDmverity bool `toml:"enable_dmverity"`
+
+	// EnableDmverityReferrers builds each tar layer from the EROFS tar index,
+	// dm-verity hash tree and root-hash signature published in the image's
+	// application/vnd.containerd.erofs.dmverity.v1 referrer. Every tar layer
+	// must be signed. mkfs.erofs is not needed. Pair it with the erofs
+	// snapshotter's enable_dmverity_referrers, which fetches the referrers.
+	EnableDmverityReferrers bool `toml:"enable_dmverity_referrers"`
 }
 
 func init() {
@@ -53,12 +60,15 @@ func init() {
 		},
 		Config: &Config{},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
-			tarModeSupported, err := erofsutils.SupportGenerateFromTar()
-			if err != nil {
-				return nil, fmt.Errorf("failed to check mkfs.erofs availability: %v: %w", err, plugin.ErrSkipPlugin)
-			}
-			if !tarModeSupported {
-				return nil, fmt.Errorf("mkfs.erofs does not support tar mode (--tar option), disabling erofs differ: %w", plugin.ErrSkipPlugin)
+			config := ic.Config.(*Config)
+			if !config.EnableDmverityReferrers {
+				tarModeSupported, err := erofsutils.SupportGenerateFromTar()
+				if err != nil {
+					return nil, fmt.Errorf("failed to check mkfs.erofs availability: %v: %w", err, plugin.ErrSkipPlugin)
+				}
+				if !tarModeSupported {
+					return nil, fmt.Errorf("mkfs.erofs does not support tar mode (--tar option), disabling erofs differ: %w", plugin.ErrSkipPlugin)
+				}
 			}
 
 			md, err := ic.GetSingle(plugins.MetadataPlugin)
@@ -73,7 +83,6 @@ func init() {
 			p.OSFeatures = []string{"erofs"}
 			ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 			cs := md.(*metadata.DB).ContentStore()
-			config := ic.Config.(*Config)
 
 			var opts []erofs.DifferOpt
 
@@ -94,6 +103,13 @@ func init() {
 					return nil, fmt.Errorf("dm-verity is not supported on this system (dm_verity module not loaded): %w", plugin.ErrSkipPlugin)
 				}
 				opts = append(opts, erofs.WithDmverity())
+			}
+			if config.EnableDmverityReferrers {
+				supported, err := dmverity.IsSupported()
+				if err != nil || !supported {
+					return nil, fmt.Errorf("enable_dmverity_referrers needs dm-verity, which is not supported on this system: %v: %w", err, plugin.ErrSkipPlugin)
+				}
+				opts = append(opts, erofs.WithDmverityReferrers())
 			}
 
 			return erofs.NewErofsDiffer(cs, opts...), nil

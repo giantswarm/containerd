@@ -1644,3 +1644,77 @@ func TestCacheDirMustBeAbsolute(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyDmverityPolicyReferrers covers the refusal to mount a layer without
+// the dm-verity metadata and root-hash signature that the erofs differ stores
+// for a layer unpacked from a signed dm-verity referrer.
+func TestApplyDmverityPolicyReferrers(t *testing.T) {
+	for _, mode := range []string{"auto", "on"} {
+		t.Run(mode, func(t *testing.T) {
+			layerBlob := createTestLayerBlob(t, t.TempDir())
+			s := &snapshotter{dmverityMode: mode, dmverityReferrers: true}
+
+			_, err := s.applyDmverityPolicy(layerBlob)
+			require.ErrorContains(t, err, "layer "+layerBlob+" has no dm-verity metadata and signed dm-verity layers are required")
+
+			createDmverityMetadata(t, layerBlob)
+			_, err = s.applyDmverityPolicy(layerBlob)
+			require.ErrorContains(t, err, "layer "+layerBlob+" has no dm-verity root-hash signature and signed dm-verity layers are required")
+
+			require.NoError(t, os.WriteFile(dmverity.SignaturePath(layerBlob), []byte("signature"), 0644))
+			opt, err := s.applyDmverityPolicy(layerBlob)
+			require.NoError(t, err)
+			assert.Equal(t, "X-containerd.dmverity="+dmverity.MetadataPath(layerBlob), opt)
+		})
+	}
+}
+
+// TestMountsDmverityReferrers covers the snapshots that reach the mount
+// without passing the differ's signature check, for example ones unpacked
+// before signed layers were required: they are not mounted, and a merged
+// fsmeta, which addresses the layers without dm-verity, is not used.
+func TestMountsDmverityReferrers(t *testing.T) {
+	root := t.TempDir()
+	s := &snapshotter{root: root, dmverityMode: "auto", dmverityReferrers: true}
+
+	parents := []string{"p0", "p1"}
+	for _, id := range parents {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "snapshots", id), 0755))
+		require.NoError(t, os.WriteFile(s.layerBlobPath(id), []byte("layer"), 0644))
+	}
+	view := storage.Snapshot{Kind: snapshots.KindView, ID: "v", ParentIDs: parents}
+	infos := make([]snapshots.Info, len(parents))
+
+	t.Run("unsigned layers are not mounted", func(t *testing.T) {
+		_, err := s.mounts(view, snapshots.Info{}, infos)
+		require.ErrorContains(t, err, "has no dm-verity metadata and signed dm-verity layers are required")
+
+		_, err = s.mounts(storage.Snapshot{Kind: snapshots.KindCommitted, ID: "p0"}, snapshots.Info{}, nil)
+		require.ErrorContains(t, err, "layer "+s.layerBlobPath("p0")+" has no dm-verity metadata")
+	})
+
+	t.Run("signed layers are mounted one by one through dm-verity", func(t *testing.T) {
+		for _, id := range parents {
+			createDmverityMetadata(t, s.layerBlobPath(id))
+			require.NoError(t, os.WriteFile(dmverity.SignaturePath(s.layerBlobPath(id)), []byte("signature"), 0644))
+		}
+		require.NoError(t, os.WriteFile(s.fsMetaPath("p0"), []byte("merged"), 0644))
+
+		mounts, err := s.mounts(view, snapshots.Info{}, infos)
+		require.NoError(t, err)
+		var layers []string
+		for _, m := range mounts {
+			if m.Type != "erofs" {
+				continue
+			}
+			assert.Contains(t, m.Options, "X-containerd.dmverity="+dmverity.MetadataPath(m.Source))
+			layers = append(layers, m.Source)
+		}
+		assert.ElementsMatch(t, []string{s.layerBlobPath("p0"), s.layerBlobPath("p1")}, layers)
+	})
+}
+
+func TestDmverityReferrersNeedDmverity(t *testing.T) {
+	_, err := NewSnapshotter(t.TempDir(), WithDmverityReferrers(), WithDmverityMode("off"))
+	require.ErrorContains(t, err, "enable_dmverity_referrers requires dm-verity, but dmverity_mode is 'off'")
+}

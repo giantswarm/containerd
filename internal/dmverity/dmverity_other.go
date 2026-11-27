@@ -48,3 +48,15 @@ func Close(_ string) error {
 func VerifyDevice(_ string, _ string) error {
 	return errUnsupported
 }
+
+func WriteMetadata(_ string, _ DmverityMetadata) error {
+	return errUnsupported
+}
+
+func VerifyLayer(_ string, _ uint64, _ string) error {
+	return errUnsupported
+}
+
+func OpenSigned(_ string, _ string, _ string, _ string, _ uint64, _ string) (string, error) {
+	return "", errUnsupported
+}

@@ -68,6 +68,12 @@ func DevicePath(name string) string {
 	return fmt.Sprintf("/dev/mapper/%s", name)
 }
 
+// SignaturePath returns the path of the PKCS#7 signature over the root hash of
+// a layer, stored next to the layer blob.
+func SignaturePath(layerBlobPath string) string {
+	return layerBlobPath + ".sig"
+}
+
 type DmverityMetadata struct {
 	RootHash   string `json:"roothash"`
 	HashOffset uint64 `json:"hashoffset"`
