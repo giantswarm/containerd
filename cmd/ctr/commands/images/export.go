@@ -1,0 +1,202 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package images
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+
+	"github.com/urfave/cli/v3"
+
+	"github.com/containerd/containerd/v2/cmd/ctr/commands"
+	"github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/transfer"
+	tarchive "github.com/containerd/containerd/v2/core/transfer/archive"
+	"github.com/containerd/containerd/v2/core/transfer/image"
+	"github.com/containerd/platforms"
+)
+
+var exportCommand = &cli.Command{
+	Name:      "export",
+	Usage:     "Export images",
+	ArgsUsage: "[flags] <out> <image> ...",
+	Description: `Export images to an OCI tar archive.
+
+Tar output is formatted as an OCI archive, a Docker manifest is provided for the platform.
+Use '--skip-manifest-json' to avoid including the Docker manifest.json file.
+Use '--platform' to define the output platform.
+When '--all-platforms' is given all images in a manifest list must be available.
+`,
+	Flags: []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "skip-manifest-json",
+			Usage: "Do not add Docker compatible manifest.json to archive",
+		},
+		&cli.BoolFlag{
+			Name:  "skip-non-distributable",
+			Usage: "Do not add non-distributable blobs such as Windows layers to archive",
+		},
+		&cli.StringSliceFlag{
+			Name:  "platform",
+			Usage: "Pull content from a specific platform",
+		},
+		&cli.BoolFlag{
+			Name:  "all-platforms",
+			Usage: "Exports content from all platforms",
+		},
+		&cli.BoolFlag{
+			Name:  "local",
+			Usage: "Run export locally rather than through transfer API",
+		},
+	},
+	DisableSliceFlagSeparator: true,
+	Action: func(ctx context.Context, cmd *cli.Command) error {
+		var (
+			exportOpts = []archive.ExportOpt{}
+		)
+		cmd, out, images, err := resolveExportArgs(ctx, cmd)
+		if err != nil {
+			return err
+		}
+
+		client, ctx, cancel, err := commands.NewClient(ctx, cmd)
+		if err != nil {
+			return err
+		}
+		defer cancel()
+
+		var w io.WriteCloser
+		if out == "-" {
+			w = os.Stdout
+		} else {
+			w, err = os.Create(out)
+			if err != nil {
+				return err
+			}
+		}
+		defer w.Close()
+
+		if !cmd.Bool("local") {
+			pf, done := ProgressHandler(ctx, os.Stdout)
+			defer done()
+
+			exportOpts := []tarchive.ExportOpt{}
+			if pss := cmd.StringSlice("platform"); len(pss) > 0 {
+				for _, ps := range pss {
+					p, err := platforms.Parse(ps)
+					if err != nil {
+						return fmt.Errorf("invalid platform %q: %w", ps, err)
+					}
+					exportOpts = append(exportOpts, tarchive.WithPlatform(p))
+				}
+			}
+			if cmd.Bool("all-platforms") {
+				exportOpts = append(exportOpts, tarchive.WithAllPlatforms)
+			}
+
+			if cmd.Bool("skip-manifest-json") {
+				exportOpts = append(exportOpts, tarchive.WithSkipCompatibilityManifest)
+			}
+
+			if cmd.Bool("skip-non-distributable") {
+				exportOpts = append(exportOpts, tarchive.WithSkipNonDistributableBlobs)
+			}
+
+			storeOpts := make([]image.StoreOpt, len(images))
+			for i, img := range images {
+				storeOpts[i] = image.WithExtraReference(img)
+			}
+
+			return client.Transfer(ctx,
+				image.NewStore("", storeOpts...),
+				tarchive.NewImageExportStream(w, "", exportOpts...),
+				transfer.WithProgress(pf),
+			)
+		}
+
+		if pss := cmd.StringSlice("platform"); len(pss) > 0 {
+			all, err := platforms.ParseAll(pss)
+			if err != nil {
+				return err
+			}
+			exportOpts = append(exportOpts, archive.WithPlatform(platforms.Ordered(all...)))
+		} else {
+			exportOpts = append(exportOpts, archive.WithPlatform(platforms.DefaultStrict()))
+		}
+
+		if cmd.Bool("all-platforms") {
+			exportOpts = append(exportOpts, archive.WithAllPlatforms())
+		}
+
+		if cmd.Bool("skip-manifest-json") {
+			exportOpts = append(exportOpts, archive.WithSkipDockerManifest())
+		}
+
+		if cmd.Bool("skip-non-distributable") {
+			exportOpts = append(exportOpts, archive.WithSkipNonDistributableBlobs())
+		}
+
+		is := client.ImageService()
+		for _, img := range images {
+			exportOpts = append(exportOpts, archive.WithImage(is, img))
+		}
+
+		return client.Export(ctx, w, exportOpts...)
+	},
+}
+
+func resolveExportArgs(ctx context.Context, cmd *cli.Command) (*cli.Command, string, []string, error) {
+	out := cmd.Args().First()
+	images := cmd.Args().Tail()
+	// Work around a bug in urfave/cli/v3 where a "-" positional argument
+	// causes parseFlags to break out of the argument loop and drop all
+	// subsequent arguments.
+	// TODO: Remove this workaround once https://github.com/urfave/cli/issues/2418
+	// (https://github.com/urfave/cli/pull/2419) is resolved and vendored.
+	if out == "-" && len(cmd.Lineage()) > 1 {
+		const dashArgSentinel = "\x00-\x00"
+		rawArgs := cmd.Lineage()[1].Args().Slice()
+		end := slices.Index(rawArgs, "--")
+		if end == -1 {
+			end = len(rawArgs)
+		}
+		if dashIdx := slices.Index(rawArgs[:end], "-"); dashIdx != -1 {
+			for i, arg := range rawArgs[dashIdx:end] {
+				if arg == "-" {
+					rawArgs[dashIdx+i] = dashArgSentinel
+				}
+			}
+			sanitized := slices.Concat([]string{cmd.Name}, rawArgs[dashIdx:])
+			reparse := *cmd
+			reparse.Action = func(_ context.Context, c *cli.Command) error {
+				images = c.Args().Tail()
+				return nil
+			}
+			if err := reparse.Run(ctx, sanitized); err != nil {
+				return nil, "", nil, err
+			}
+		}
+	}
+	if out == "" || len(images) == 0 {
+		return nil, "", nil, errors.New("please provide both an output filename and an image reference to export")
+	}
+	return cmd, out, images, nil
+}

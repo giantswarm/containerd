@@ -1,0 +1,70 @@
+# Fork (giantswarm/containerd): ours to keep (FORK.md, "Branches").
+#
+# Keeps `main` the mirror of upstream's main: a fast-forward push as the
+# HeraldBot App (upstream's commits change .github/workflows, which
+# GITHUB_TOKEN may not push), then a cancel of the workflow runs that push
+# starts from upstream's workflow files, which have nothing to do here. A
+# push that is not a fast-forward fails: upstream never rewrites its main, so
+# a failure here is for a human to look at. The line itself (`giantswarm`)
+# moves only by pull request and by a re-pin (FORK.md, "Re-pin").
+name: Sync upstream main
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.repository == 'giantswarm/containerd'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Generate the HeraldBot token
+        id: token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ secrets.HERALD_CLIENT_ID }}
+          private-key: ${{ secrets.HERALD_APP_KEY }}
+          permission-contents: write
+          permission-workflows: write
+      - name: Fast-forward main
+        id: push
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -o errexit -o nounset -o pipefail
+          ours="https://github.com/${GITHUB_REPOSITORY}.git"
+          git init --quiet mirror
+          cd mirror
+          git fetch --quiet --no-tags "${ours}" main
+          git fetch --quiet --no-tags https://github.com/containerd/containerd.git main
+          upstream=$(git rev-parse FETCH_HEAD)
+          if [ "$(git ls-remote "${ours}" refs/heads/main | cut -f1)" = "${upstream}" ]; then
+            echo "main is current at ${upstream}"
+            exit 0
+          fi
+          git push --quiet "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${upstream}:refs/heads/main"
+          echo "main fast-forwarded to ${upstream}"
+          echo "sha=${upstream}" >> "${GITHUB_OUTPUT}"
+      - name: Cancel the runs of upstream's workflows
+        if: steps.push.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.push.outputs.sha }}
+        run: |
+          set -o errexit -o nounset -o pipefail
+          # Give the push's runs time to be created.
+          sleep 30
+          gh run list --repo "${GITHUB_REPOSITORY}" --branch main --commit "${SHA}" \
+            --json databaseId,status --jq '.[] | select(.status != "completed") | .databaseId' |
+            while read -r id; do
+              gh run cancel "${id}" --repo "${GITHUB_REPOSITORY}" || true
+            done

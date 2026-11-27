@@ -1,0 +1,1560 @@
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
+package docker
+
+import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"net/http"
+	"net/http/httptest"
+	"net/textproto"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/containerd/errdefs"
+	"github.com/klauspost/compress/zstd"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
+
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/transfer"
+	"github.com/containerd/containerd/v2/pkg/reference"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+)
+
+type writeFunc func(p []byte) (int, error)
+
+func (f writeFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestHTTPReadSeekerClosesBodyAtEOF(t *testing.T) {
+	payload := []byte("layer content")
+	path := filepath.Join(t.TempDir(), "body")
+	require.NoError(t, os.WriteFile(path, payload, 0600))
+	var bodies []*os.File
+	rc, err := newHTTPReadSeeker(int64(len(payload)), func(offset int64) (io.ReadCloser, error) {
+		body, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := body.Seek(offset, io.SeekStart); err != nil {
+			body.Close()
+			return nil, err
+		}
+		bodies = append(bodies, body)
+		return body, nil
+	})
+	require.NoError(t, err)
+	defer rc.Close()
+
+	for i := range 2 {
+		data, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		require.Equal(t, payload, data)
+		require.Len(t, bodies, i+1)
+		// The HTTP body must be closed before the caller commits its writer,
+		// without closing the seekable reader needed for a possible reset.
+		_, err = bodies[i].Read(make([]byte, 1))
+		require.ErrorIs(t, err, os.ErrClosed)
+		_, err = rc.(io.Seeker).Seek(0, io.SeekStart)
+		require.NoError(t, err)
+	}
+}
+
+func TestFetchClosesHTTPBodyBeforeCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	payload := []byte("layer content")
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayer,
+		Digest:    digest.FromBytes(payload),
+		Size:      int64(len(payload)),
+	}
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.Write(payload)
+	}))
+	defer registry.Close()
+	var closed atomic.Int32
+	client := registry.Client()
+	transport := client.Transport
+	client.Transport = rtFunc(func(r *http.Request) (*http.Response, error) {
+		resp, err := transport.RoundTrip(r)
+		if err == nil {
+			resp.Body = &fnOnClose{
+				ReadCloser:  resp.Body,
+				BeforeClose: func() { closed.Add(1) },
+			}
+		}
+		return resp, err
+	})
+	resolver := NewResolver(ResolverOptions{Client: client, PlainHTTP: true})
+	fetcher, err := resolver.Fetcher(ctx, strings.TrimPrefix(registry.URL, "http://")+"/image:latest")
+	require.NoError(t, err)
+	store, err := local.NewStore(t.TempDir())
+	require.NoError(t, err)
+	committed := false
+	ingester := beforeCommitIngester{Ingester: store, beforeCommit: func() {
+		// Even if Commit blocks, CRI must no longer count this HTTP request
+		// as active. Check before Fetch's deferred reader.Close can run.
+		require.EqualValues(t, 1, closed.Load())
+		committed = true
+	}}
+	require.NoError(t, remotes.Fetch(ctx, ingester, fetcher, desc))
+	require.True(t, committed)
+	require.EqualValues(t, 1, closed.Load())
+}
+
+type beforeCommitIngester struct {
+	content.Ingester
+	beforeCommit func()
+}
+
+func (i beforeCommitIngester) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
+	w, err := i.Ingester.Writer(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return beforeCommitWriter{Writer: w, beforeCommit: i.beforeCommit}, nil
+}
+
+type beforeCommitWriter struct {
+	content.Writer
+	beforeCommit func()
+}
+
+func (w beforeCommitWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...content.Opt) error {
+	w.beforeCommit()
+	return w.Writer.Commit(ctx, size, expected, opts...)
+}
+
+func TestFetchRejectsNegativeSize(t *testing.T) {
+	_, err := newHTTPReadSeeker(-2, func(int64) (io.ReadCloser, error) {
+		return nil, nil
+	})
+	require.ErrorIs(t, err, errdefs.ErrInvalidArgument)
+
+	f := dockerFetcher{&dockerBase{
+		hosts: []RegistryHost{{
+			Host:         "example.com",
+			Scheme:       "https",
+			Capabilities: HostCapabilityPull,
+		}},
+	}}
+	_, err = f.Fetch(t.Context(), ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayer,
+		Digest:    digest.FromBytes([]byte("layer")),
+		Size:      -1,
+	})
+	require.ErrorIs(t, err, errdefs.ErrInvalidArgument)
+}
+
+func TestFetchRejectsOversizedStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	const declaredSize = 121
+	payload := bytes.Repeat([]byte("A"), declaredSize)
+	dgst := digest.FromBytes(payload)
+
+	var streamWrites atomic.Int64
+	streamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		chunk := bytes.Repeat([]byte("A"), 1024)
+		for {
+			n, err := w.Write(chunk)
+			streamWrites.Add(int64(n))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}))
+	defer streamServer.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer registry.Close()
+
+	resolver := NewResolver(ResolverOptions{PlainHTTP: true})
+	fetcher, err := resolver.Fetcher(ctx, strings.TrimPrefix(registry.URL, "http://")+"/image:latest")
+	require.NoError(t, err)
+
+	desc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageLayerGzip,
+		Digest:    dgst,
+		Size:      declaredSize,
+		URLs:      []string{streamServer.URL + "/layer"},
+	}
+
+	t.Run("direct Fetch reader", func(t *testing.T) {
+		rc, err := fetcher.Fetch(ctx, desc)
+		require.NoError(t, err)
+		defer rc.Close()
+
+		_, err = io.Copy(io.Discard, rc)
+		require.ErrorIs(t, err, errdefs.ErrFailedPrecondition)
+	})
+
+	t.Run("remotes.Fetch to content store", func(t *testing.T) {
+		store, err := local.NewStore(t.TempDir())
+		require.NoError(t, err)
+
+		err = remotes.Fetch(ctx, store, fetcher, desc)
+		require.ErrorIs(t, err, errdefs.ErrFailedPrecondition)
+
+		_, err = store.Info(ctx, dgst)
+		require.ErrorIs(t, err, errdefs.ErrNotFound)
+	})
+}
+
+func TestFetcherOpen(t *testing.T) {
+	content := make([]byte, 128)
+	rand.New(rand.NewSource(1)).Read(content)
+	start := 0
+
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if start > 0 {
+			rw.Header().Set("content-range", fmt.Sprintf("bytes %d-127/128", start))
+		} else if r.Header.Get("Range") == "bytes=0-" {
+			// Simulate registries which do not support range requests
+			rw.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rw.Header().Set("content-length", strconv.Itoa(len(content[start:])))
+		_, _ = rw.Write(content[start:])
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f := dockerFetcher{&dockerBase{
+		repository: "nonempty",
+	}}
+
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+
+	ctx := context.Background()
+
+	req := f.request(host, http.MethodGet)
+
+	checkReader := func(o int64) {
+		t.Helper()
+
+		rc, _, err := f.open(ctx, req, "", o, true)
+		if err != nil {
+			t.Fatalf("failed to open: %+v", err)
+		}
+		b, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := content[o:]
+		if len(b) != len(expected) {
+			t.Errorf("unexpected length %d, expected %d", len(b), len(expected))
+			return
+		}
+		for i, c := range expected {
+			if b[i] != c {
+				t.Errorf("unexpected byte %x at %d, expected %x", b[i], i, c)
+				return
+			}
+		}
+
+	}
+
+	checkReader(0)
+
+	// Test server ignores content range
+	checkReader(25)
+
+	// Use content range on server
+	start = 20
+	checkReader(20)
+
+	// Check returning just last byte and no bytes
+	start = 127
+	checkReader(127)
+	start = 128
+	checkReader(128)
+
+	// Check that server returning a different content range
+	// then requested errors
+	start = 30
+	_, _, err = f.open(ctx, req, "", 20, true)
+	if err == nil {
+		t.Fatal("expected error opening with invalid server response")
+	}
+}
+
+func TestFetcherOpenParallel(t *testing.T) {
+	size := int64(3 * 1024 * 1024)
+	content := make([]byte, size)
+	rand.New(rand.NewSource(1)).Read(content)
+	sendContentLength := true
+
+	f := dockerFetcher{
+		&dockerBase{
+			repository: "nonempty",
+			limiter:    nil,
+			performances: transfer.ImageResolverPerformanceSettings{
+				ConcurrentLayerFetchBuffer: 0,
+			},
+		},
+	}
+
+	cfgConcurency := func(maxConcurrentDls, chunkSize int) {
+		f.dockerBase.performances.MaxConcurrentDownloads = maxConcurrentDls
+		f.dockerBase.performances.ConcurrentLayerFetchBuffer = chunkSize
+		limiter := semaphore.NewWeighted(int64(maxConcurrentDls))
+		f.dockerBase.limiter = limiter
+	}
+
+	ignoreContentRange := false
+	var failTimeoutOnceAfter atomic.Int64
+	failAfter := int64(0)
+	var forceRange []httpRange
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rng, err := parseRange(r.Header.Get("Range"), size)
+		if errors.Is(err, errNoOverlap) {
+			err = nil
+		}
+		assert.NoError(t, err)
+		if ignoreContentRange {
+			rng = nil
+		}
+		if forceRange != nil {
+			rng = forceRange
+		}
+		if failAfter > 0 && rng[0].start > failAfter {
+			rw.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		timeoutOnceAfter := failTimeoutOnceAfter.Load()
+		if timeoutOnceAfter > 0 && rng[0].start > timeoutOnceAfter {
+			failTimeoutOnceAfter.Store(0)
+			rw.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+
+		if len(rng) == 0 {
+			if sendContentLength {
+				rw.Header().Set("content-length", strconv.Itoa(len(content)))
+			}
+			_, _ = rw.Write(content)
+		} else {
+			b := content[rng[0].start : rng[0].start+rng[0].length]
+			rw.Header().Set("content-range", rng[0].contentRange(size))
+			if sendContentLength {
+				rw.Header().Set("content-length", strconv.Itoa(len(b)))
+			}
+			_, _ = rw.Write(b)
+		}
+
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+
+	ctx := context.Background()
+
+	req := f.request(host, http.MethodGet)
+
+	checkReader := func(offset int64) {
+		t.Helper()
+
+		rc, _, err := f.open(ctx, req, "", offset, true)
+		if err != nil {
+			t.Fatalf("failed to open: %+v", err)
+		}
+		b, err := io.ReadAll(rc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := content[offset:]
+		if len(b) != len(expected) {
+			t.Errorf("unexpected length %d, expected %d", len(b), len(expected))
+			return
+		}
+		for i, c := range expected {
+			if b[i] != c {
+				t.Errorf("unexpected byte %x at %d, expected %x", b[i], i, c)
+				return
+			}
+		}
+		assert.NoError(t, rc.Close())
+	}
+
+	cfgConcurency(10, 1*1024*1024)
+	checkReader(0)
+
+	checkReader(25)
+
+	sendContentLength = false
+	checkReader(25)
+	sendContentLength = true
+
+	ignoreContentRange = true
+	checkReader(0)
+	checkReader(25)
+	ignoreContentRange = false
+
+	//Use content range on server
+	checkReader(20)
+
+	//Check returning just last byte and no bytes
+	checkReader(size - 1)
+	checkReader(size)
+
+	// Check that server returning a different content range
+	// than requested errors
+	forceRange = []httpRange{{start: 10, length: size - 20}}
+	_, _, err = f.open(ctx, req, "", 20, true)
+	if err == nil {
+		t.Fatal("expected error opening with invalid server response")
+	}
+	forceRange = nil
+
+	// check retrying a request in the middle
+	failTimeoutOnceAfter.Store(1 * 1024 * 1024)
+	checkReader(20)
+
+	failAfter = 1
+	forceRange = []httpRange{{start: 20}}
+	_, _, err = f.open(ctx, req, "", 20, true)
+	assert.ErrorContains(t, err, "unexpected status")
+	forceRange = nil
+	failAfter = 0
+
+	// test a case when a subsequent request fails and shouldn't have
+	failAfter = 1 * 1024 * 1024
+	body, _, err := f.open(ctx, req, "", 0, true)
+	assert.NoError(t, err)
+	_, err = io.ReadAll(body)
+	assert.Error(t, err, "this should have failed")
+}
+
+func TestFetcherOpenParallel_CloseAfterCopyError(t *testing.T) {
+	// The server blocks every chunk after the first until the test ends.
+	// Close must not wait for those downloads after a write error.
+	unblock := make(chan struct{})
+	t.Cleanup(func() { close(unblock) })
+	s := newWindowServer(t, 10, func(r *http.Request, rng []httpRange) bool {
+		if len(rng) > 0 && rng[0].start > 0 {
+			select {
+			case <-r.Context().Done():
+				return false
+			case <-unblock:
+			}
+		}
+		return true
+	})
+
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+	f := dockerFetcher{&dockerBase{
+		repository: "nonempty",
+		limiter:    semaphore.NewWeighted(4),
+		performances: transfer.ImageResolverPerformanceSettings{
+			MaxConcurrentDownloads:     4,
+			ConcurrentLayerFetchBuffer: windowChunkSize,
+		},
+	}}
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+	rc, _, err := f.open(context.Background(), f.request(host, http.MethodGet), "", 0, true)
+	require.NoError(t, err, "failed to open reader")
+
+	var written int64
+	_, copyErr := io.Copy(writeFunc(func(p []byte) (int, error) {
+		written += int64(len(p))
+		if written >= 1024 {
+			return 0, errors.New("simulated write failure after limit reached")
+		}
+		return len(p), nil
+	}), rc)
+	require.Error(t, copyErr, "expected write error during copy")
+
+	require.NoError(t, returnsWithin(t, "close", rc.Close))
+}
+
+func TestFetcherOpenParallel_LargeContentLength(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/octet-stream")
+		rw.Header().Set("Content-Length", strconv.FormatInt(math.MaxInt64, 10))
+		rw.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", math.MaxInt64-1, math.MaxInt64))
+		rw.Header().Set("Connection", "close")
+		rw.WriteHeader(http.StatusPartialContent)
+		_, _ = rw.Write([]byte("C"))
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+
+	f := dockerFetcher{
+		&dockerBase{
+			repository: "nonempty",
+			limiter:    semaphore.NewWeighted(3),
+			performances: transfer.ImageResolverPerformanceSettings{
+				MaxConcurrentDownloads:     3,
+				ConcurrentLayerFetchBuffer: 512,
+			},
+		},
+	}
+
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+
+	req := f.request(host, http.MethodGet)
+	rc, _, err := f.open(context.Background(), req, "", 0, true)
+	require.NoError(t, err)
+	defer rc.Close()
+
+	_, err = io.ReadAll(rc)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+func TestFetcherOpenParallel_WindowAdvances(t *testing.T) {
+	const (
+		chunkSize   = 512
+		parallelism = 2
+		numChunks   = 6
+		size        = chunkSize * numChunks
+	)
+	content := make([]byte, size)
+	_, err := rand.New(rand.NewSource(1)).Read(content)
+	require.NoError(t, err)
+
+	// chunkReqCh stores the chunk indices of served content so the test can
+	// observe when each chunk is requested.
+	chunkReqCh := make(chan int64, numChunks)
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rng, err := parseRange(r.Header.Get("Range"), size)
+		assert.NoError(t, err)
+		require.Len(t, rng, 1)
+
+		// Slice the requested byte range from content and write it back as a
+		// 206 Partial Content response.
+		b := content[rng[0].start : rng[0].start+rng[0].length]
+		rw.Header().Set("Content-Range", rng[0].contentRange(size))
+		rw.Header().Set("Content-Length", strconv.Itoa(len(b)))
+		rw.WriteHeader(http.StatusPartialContent)
+		_, _ = rw.Write(b)
+
+		// Convert the byte offset of the range start into its chunk index.
+		chunkReqCh <- rng[0].start / chunkSize
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+
+	f := dockerFetcher{
+		&dockerBase{
+			repository: "nonempty",
+			limiter:    semaphore.NewWeighted(parallelism),
+			performances: transfer.ImageResolverPerformanceSettings{
+				MaxConcurrentDownloads:     parallelism,
+				ConcurrentLayerFetchBuffer: chunkSize,
+			},
+		},
+	}
+
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+
+	req := f.request(host, http.MethodGet)
+	fetchedReader, _, err := f.open(context.Background(), req, "", 0, true)
+	require.NoError(t, err)
+	defer fetchedReader.Close()
+
+	// Chunks 0 and 1 fill the initial window of size 2.
+	assert.Equal(t, int64(0), <-chunkReqCh)
+	assert.Equal(t, int64(1), <-chunkReqCh)
+	assert.Empty(t, chunkReqCh)
+
+	// Read one full chunk (chunk 0) from fetchedReader.
+	got := make([]byte, size)
+	n, err := io.ReadFull(fetchedReader, got[:chunkSize])
+	require.NoError(t, err)
+	assert.Equal(t, chunkSize, n)
+	assert.Equal(t, content[:chunkSize], got[:chunkSize])
+	// io.ReadFull stops once got[:chunkSize] is filled and does not read past
+	// the end of chunk 0. pipeReader returns io.EOF on the first Read after
+	// its buffer is emptied; chunkReader has not observed io.EOF on chunk 0 or
+	// released its slot yet.
+	assert.Empty(t, chunkReqCh)
+
+	// Each subsequent io.ReadFull reads past the end of the previous chunk's
+	// pipe. That read hits io.EOF on the previous pipe and releases one slot
+	// so the dispatcher requests the next chunk.
+	for chunkIdx := int64(1); chunkIdx < numChunks; chunkIdx++ {
+		n, err = io.ReadFull(fetchedReader, got[chunkIdx*chunkSize:(chunkIdx+1)*chunkSize])
+		require.NoError(t, err)
+		assert.Equal(t, chunkSize, n)
+		if chunkIdx+1 < numChunks {
+			assert.Equal(t, chunkIdx+1, <-chunkReqCh)
+			assert.Empty(t, chunkReqCh)
+		}
+	}
+
+	n, err = fetchedReader.Read(make([]byte, 1))
+	assert.Equal(t, 0, n)
+	assert.ErrorIs(t, err, io.EOF)
+	assert.Equal(t, content, got)
+}
+
+func TestFetcherOpenParallel_CancelWaitingForSlot(t *testing.T) {
+	const (
+		chunkSize   = 512
+		parallelism = 2
+		numChunks   = 4
+		size        = chunkSize * numChunks
+	)
+	content := bytes.Repeat([]byte("A"), size)
+
+	chunk1Served := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rng, err := parseRange(r.Header.Get("Range"), size)
+		assert.NoError(t, err)
+		require.Len(t, rng, 1)
+
+		b := content[rng[0].start : rng[0].start+rng[0].length]
+		rw.Header().Set("Content-Range", rng[0].contentRange(size))
+		rw.Header().Set("Content-Length", strconv.Itoa(len(b)))
+		rw.WriteHeader(http.StatusPartialContent)
+		_, _ = rw.Write(b)
+
+		if rng[0].start == chunkSize {
+			close(chunk1Served)
+		}
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+
+	limiter := semaphore.NewWeighted(1)
+	f := dockerFetcher{
+		&dockerBase{
+			repository: "nonempty",
+			limiter:    limiter,
+			performances: transfer.ImageResolverPerformanceSettings{
+				MaxConcurrentDownloads:     parallelism,
+				ConcurrentLayerFetchBuffer: chunkSize,
+			},
+		},
+	}
+
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := f.request(host, http.MethodGet)
+	fetchedReader, _, err := f.open(ctx, req, "", 0, true)
+	require.NoError(t, err)
+	defer fetchedReader.Close()
+
+	// Read exactly chunkSize bytes of chunk 0. Because we have not read past
+	// chunkSize, pipe 0 has not returned io.EOF yet and both slots remain
+	// occupied while chunk 1 buffers.
+	buf := make([]byte, chunkSize)
+	n, err := io.ReadFull(fetchedReader, buf)
+	require.NoError(t, err)
+	assert.Equal(t, chunkSize, n)
+
+	<-chunk1Served
+	// Worker 1 acquires the single limiter token before requesting chunk 1 and
+	// releases it via defer after closing pipe 1. Acquiring and holding that
+	// token here waits until chunk 1 is completely buffered in pipe 1 and
+	// prevents any worker from starting chunk 2.
+	require.NoError(t, limiter.Acquire(context.Background(), 1))
+
+	// Cancel while the dispatcher is blocked waiting for a slot for chunk 2.
+	cancel()
+
+	rest, err := io.ReadAll(fetchedReader)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, content[chunkSize:2*chunkSize], rest)
+}
+
+func TestFetcherDescURLsDoesNotForwardResolverHeaders(t *testing.T) {
+	body := []byte("ok")
+
+	headersCh := make(chan http.Header, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		headersCh <- r.Header.Clone()
+		rw.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = rw.Write(body)
+	}))
+	defer s.Close()
+
+	refspec, err := reference.Parse("example.com/library/test:latest")
+	require.NoError(t, err)
+
+	f := dockerFetcher{&dockerBase{
+		refspec:    refspec,
+		repository: "library/test",
+		header: http.Header{
+			"Authorization":       {"Bearer should-strip"},
+			"Proxy-Authorization": {"Basic should-strip"},
+			"Cookie":              {"a=b"},
+			"Cookie2":             {"c=d"},
+			"X-Test":              {"should-stay"},
+		},
+		hosts: []RegistryHost{{
+			Host:         "example.com",
+			Scheme:       "https",
+			Capabilities: HostCapabilityPull,
+		}},
+	}}
+
+	desc := ocispec.Descriptor{
+		MediaType: "application/octet-stream",
+		Size:      int64(len(body)),
+		URLs:      []string{s.URL},
+	}
+
+	rc, err := f.Fetch(context.Background(), desc)
+	require.NoError(t, err)
+	_, err = io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	select {
+	case hdr := <-headersCh:
+		assert.Empty(t, hdr.Get("Authorization"))
+		assert.Empty(t, hdr.Get("Proxy-Authorization"))
+		assert.Empty(t, hdr.Get("Cookie"))
+		assert.Empty(t, hdr.Get("Cookie2"))
+		assert.Equal(t, "should-stay", hdr.Get("X-Test"))
+	case <-time.After(time.Second):
+		t.Fatal("descriptor URL server did not receive a request")
+	}
+}
+
+func TestIsRegistryOrigin(t *testing.T) {
+	tests := []struct {
+		name          string
+		descriptorURL string
+		registryHost  RegistryHost
+		want          bool
+	}{
+		{
+			name:          "https implicit and explicit default port",
+			descriptorURL: "https://example.com/layer",
+			registryHost:  RegistryHost{Scheme: "https", Host: "example.com:443"},
+			want:          true,
+		},
+		{
+			name:          "https explicit and implicit default port",
+			descriptorURL: "https://example.com:443/layer",
+			registryHost:  RegistryHost{Scheme: "https", Host: "example.com"},
+			want:          true,
+		},
+		{
+			name:          "http implicit and explicit default port",
+			descriptorURL: "http://example.com/layer",
+			registryHost:  RegistryHost{Scheme: "http", Host: "example.com:80"},
+			want:          true,
+		},
+		{
+			name:          "matching non-default port",
+			descriptorURL: "https://example.com:8443/layer",
+			registryHost:  RegistryHost{Scheme: "https", Host: "example.com:8443"},
+			want:          true,
+		},
+		{
+			name:          "different non-default port",
+			descriptorURL: "https://example.com:8443/layer",
+			registryHost:  RegistryHost{Scheme: "https", Host: "example.com"},
+			want:          false,
+		},
+		{
+			name:          "different scheme",
+			descriptorURL: "http://example.com/layer",
+			registryHost:  RegistryHost{Scheme: "https", Host: "example.com"},
+			want:          false,
+		},
+		{
+			name:          "different hostname",
+			descriptorURL: "https://cdn.example.com/layer",
+			registryHost:  RegistryHost{Scheme: "https", Host: "example.com"},
+			want:          false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			u, err := url.Parse(test.descriptorURL)
+			require.NoError(t, err)
+			assert.Equal(t, test.want, isRegistryOrigin(u, []RegistryHost{test.registryHost}))
+		})
+	}
+}
+
+func TestFetcherDescURLsForwardsResolverHeadersToRegistryOrigin(t *testing.T) {
+	body := []byte("ok")
+
+	headersCh := make(chan http.Header, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		headersCh <- r.Header.Clone()
+		rw.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = rw.Write(body)
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+	refspec, err := reference.Parse("example.com/library/test:latest")
+	require.NoError(t, err)
+
+	f := dockerFetcher{&dockerBase{
+		refspec:    refspec,
+		repository: "library/test",
+		header: http.Header{
+			"Authorization":       {"Bearer should-stay"},
+			"Proxy-Authorization": {"Basic should-stay"},
+			"Cookie":              {"a=b"},
+			"Cookie2":             {"c=d"},
+			"X-Test":              {"should-stay"},
+		},
+		hosts: []RegistryHost{{
+			Host:         u.Host,
+			Scheme:       u.Scheme,
+			Capabilities: HostCapabilityPull,
+		}},
+	}}
+
+	desc := ocispec.Descriptor{
+		MediaType: "application/octet-stream",
+		Size:      int64(len(body)),
+		URLs:      []string{s.URL},
+	}
+
+	rc, err := f.Fetch(context.Background(), desc)
+	require.NoError(t, err)
+	_, err = io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	select {
+	case hdr := <-headersCh:
+		assert.Equal(t, "Bearer should-stay", hdr.Get("Authorization"))
+		assert.Equal(t, "Basic should-stay", hdr.Get("Proxy-Authorization"))
+		assert.Equal(t, "a=b", hdr.Get("Cookie"))
+		assert.Equal(t, "c=d", hdr.Get("Cookie2"))
+		assert.Equal(t, "should-stay", hdr.Get("X-Test"))
+	case <-time.After(time.Second):
+		t.Fatal("descriptor URL server did not receive a request")
+	}
+}
+
+func TestFetcherBlobEndpointForwardsResolverHeaders(t *testing.T) {
+	body := []byte("ok")
+
+	headersCh := make(chan http.Header, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		headersCh <- r.Header.Clone()
+		rw.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = rw.Write(body)
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+	refspec, err := reference.Parse("example.com/library/test:latest")
+	require.NoError(t, err)
+
+	f := dockerFetcher{&dockerBase{
+		refspec:    refspec,
+		repository: "library/test",
+		header: http.Header{
+			"Authorization":       {"Bearer should-stay"},
+			"Proxy-Authorization": {"Basic should-stay"},
+			"Cookie":              {"a=b"},
+			"Cookie2":             {"c=d"},
+			"X-Test":              {"should-stay"},
+		},
+		hosts: []RegistryHost{{
+			Client:       s.Client(),
+			Host:         u.Host,
+			Scheme:       u.Scheme,
+			Capabilities: HostCapabilityPull,
+		}},
+	}}
+
+	desc := ocispec.Descriptor{
+		MediaType: "application/octet-stream",
+		Size:      int64(len(body)),
+	}
+
+	rc, err := f.Fetch(context.Background(), desc)
+	require.NoError(t, err)
+	_, err = io.ReadAll(rc)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+
+	select {
+	case hdr := <-headersCh:
+		assert.Equal(t, "Bearer should-stay", hdr.Get("Authorization"))
+		assert.Equal(t, "Basic should-stay", hdr.Get("Proxy-Authorization"))
+		assert.Equal(t, "a=b", hdr.Get("Cookie"))
+		assert.Equal(t, "c=d", hdr.Get("Cookie2"))
+		assert.Equal(t, "should-stay", hdr.Get("X-Test"))
+	case <-time.After(time.Second):
+		t.Fatal("blob server did not receive a request")
+	}
+}
+
+func TestContentEncoding(t *testing.T) {
+	t.Parallel()
+
+	zstdEncode := func(in []byte) []byte {
+		var b bytes.Buffer
+		zw, err := zstd.NewWriter(&b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = zw.Write(in)
+		if err != nil {
+			t.Fatal()
+		}
+		err = zw.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	gzipEncode := func(in []byte) []byte {
+		var b bytes.Buffer
+		gw := gzip.NewWriter(&b)
+		_, err := gw.Write(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = gw.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+	flateEncode := func(in []byte) []byte {
+		var b bytes.Buffer
+		dw, err := flate.NewWriter(&b, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = dw.Write(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = dw.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
+	}
+
+	tests := []struct {
+		encodingFuncs  []func([]byte) []byte
+		encodingHeader string
+	}{
+		{
+			encodingFuncs:  []func([]byte) []byte{},
+			encodingHeader: "",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{zstdEncode},
+			encodingHeader: "zstd",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{gzipEncode},
+			encodingHeader: "gzip",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{flateEncode},
+			encodingHeader: "deflate",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{zstdEncode, gzipEncode},
+			encodingHeader: "zstd,gzip",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{gzipEncode, flateEncode},
+			encodingHeader: "gzip,deflate",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{gzipEncode, zstdEncode},
+			encodingHeader: "gzip,zstd",
+		},
+		{
+			encodingFuncs:  []func([]byte) []byte{gzipEncode, zstdEncode, flateEncode},
+			encodingHeader: "gzip,zstd,deflate",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.encodingHeader, func(t *testing.T) {
+			t.Parallel()
+			content := make([]byte, 128)
+			rand.New(rand.NewSource(1)).Read(content)
+
+			s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				compressedContent := content
+				for _, enc := range tc.encodingFuncs {
+					compressedContent = enc(compressedContent)
+				}
+				rw.Header().Set("content-length", fmt.Sprintf("%d", len(compressedContent)))
+				rw.Header().Set("Content-Encoding", tc.encodingHeader)
+				rw.Write(compressedContent)
+			}))
+			defer s.Close()
+
+			u, err := url.Parse(s.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			f := dockerFetcher{&dockerBase{
+				repository: "nonempty",
+			}}
+
+			host := RegistryHost{
+				Client: s.Client(),
+				Host:   u.Host,
+				Scheme: u.Scheme,
+				Path:   u.Path,
+			}
+
+			req := f.request(host, http.MethodGet)
+
+			rc, _, err := f.open(context.Background(), req, "", 0, true)
+			if err != nil {
+				t.Fatalf("failed to open for encoding %s: %+v", tc.encodingHeader, err)
+			}
+			b, err := io.ReadAll(rc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected := content
+			if len(b) != len(expected) {
+				t.Errorf("unexpected length %d, expected %d", len(b), len(expected))
+				return
+			}
+			for i, c := range expected {
+				if b[i] != c {
+					t.Errorf("unexpected byte %x at %d, expected %x", b[i], i, c)
+					return
+				}
+			}
+		})
+	}
+}
+
+// New set of tests to test new error cases
+func TestDockerFetcherOpen(t *testing.T) {
+	tests := []struct {
+		name                   string
+		mockedStatus           int
+		mockedErr              error
+		want                   io.ReadCloser
+		wantErr                bool
+		wantServerMessageError bool
+		wantPlainError         bool
+		retries                int
+		lastHost               bool
+	}{
+		{
+			name:         "should return status and error.message if it exists if the registry request fails",
+			mockedStatus: http.StatusInternalServerError,
+			mockedErr: Errors{Error{
+				Code:    ErrorCodeUnknown,
+				Message: "Test Error",
+			}},
+			want:                   nil,
+			wantErr:                true,
+			wantServerMessageError: true,
+			lastHost:               false,
+		},
+		{
+			name:           "should return just status if the registry request fails and does not return a docker error",
+			mockedStatus:   http.StatusInternalServerError,
+			mockedErr:      errors.New("Non-docker error"),
+			want:           nil,
+			wantErr:        true,
+			wantPlainError: true,
+			lastHost:       false,
+		}, {
+			name:           "should return StatusRequestTimeout after exhausting attempts",
+			mockedStatus:   http.StatusRequestTimeout,
+			mockedErr:      errors.New(http.StatusText(http.StatusRequestTimeout)),
+			want:           nil,
+			wantErr:        true,
+			wantPlainError: true,
+			retries:        maxAttempts - 1,
+			lastHost:       true,
+		}, {
+			name:           "should return StatusTooManyRequests after exhausting attempts",
+			mockedStatus:   http.StatusTooManyRequests,
+			mockedErr:      errors.New(http.StatusText(http.StatusTooManyRequests)),
+			want:           nil,
+			wantErr:        true,
+			wantPlainError: true,
+			retries:        maxAttempts - 1,
+			lastHost:       true,
+		},
+		{
+			name:         "should retry once after 500",
+			mockedStatus: http.StatusInternalServerError,
+			mockedErr: Errors{Error{
+				Code:    ErrorCodeUnknown,
+				Message: "Test Error",
+			}},
+			want:                   nil,
+			wantErr:                true,
+			wantServerMessageError: true,
+			lastHost:               true,
+			retries:                1,
+		},
+		{
+			name:         "should retry once after 504",
+			mockedStatus: http.StatusGatewayTimeout,
+			mockedErr: Errors{Error{
+				Code:    ErrorCodeUnknown,
+				Message: "Test Error",
+			}},
+			want:                   nil,
+			wantErr:                true,
+			wantServerMessageError: true,
+			lastHost:               true,
+			retries:                1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			firstRequst := true
+			s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				if firstRequst {
+					firstRequst = false
+				} else {
+					tt.retries--
+				}
+				rw.WriteHeader(tt.mockedStatus)
+				bytes, _ := json.Marshal(tt.mockedErr)
+				rw.Write(bytes)
+			}))
+			defer s.Close()
+
+			u, err := url.Parse(s.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			f := dockerFetcher{&dockerBase{
+				repository: "ns",
+			}}
+
+			host := RegistryHost{
+				Client: s.Client(),
+				Host:   u.Host,
+				Scheme: u.Scheme,
+				Path:   u.Path,
+			}
+
+			req := f.request(host, http.MethodGet)
+
+			got, _, err := f.open(context.TODO(), req, "", 0, tt.lastHost)
+			assert.Equal(t, tt.wantErr, err != nil)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, 0, tt.retries)
+			if tt.wantErr {
+				expectedError := fmt.Sprintf("unexpected status from GET request to %s/ns: %v %s", s.URL, tt.mockedStatus, http.StatusText(tt.mockedStatus))
+				if tt.wantServerMessageError {
+					expectedError += "\n" + tt.mockedErr.Error()
+				}
+				assert.Equal(t, expectedError, err.Error())
+
+			}
+
+		})
+	}
+}
+
+func TestDockerFetcherOpenLimiterDeadlock(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Encoding", "gzip")
+		rw.Write([]byte("bad gzip data"))
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer s.Close()
+
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f := dockerFetcher{&dockerBase{
+		repository: "ns",
+		limiter:    semaphore.NewWeighted(int64(1)),
+	}}
+
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+
+	req := f.request(host, http.MethodGet)
+	_, _, err = f.open(context.Background(), req, "", 0, true)
+	assert.Error(t, err)
+
+	// verify that the limiter Release has been successfully called when the last open error occurred
+	_, _, err = f.open(context.Background(), req, "", 0, true)
+	assert.Error(t, err)
+}
+
+// httpRange specifies the byte range to be sent to the client.
+type httpRange struct {
+	start, length int64
+}
+
+func (r httpRange) contentRange(size int64) string {
+	return fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, size)
+}
+
+var (
+	errNoOverlap = errors.New("no overlap")
+)
+
+// parseRange parses a Range header string as per RFC 7233.
+// errNoOverlap is returned if none of the ranges overlap.
+func parseRange(s string, size int64) ([]httpRange, error) {
+	if s == "" {
+		return nil, nil // header not present
+	}
+	const b = "bytes="
+	if !strings.HasPrefix(s, b) {
+		return nil, errors.New("invalid range")
+	}
+	var ranges []httpRange
+	noOverlap := false
+	for ra := range strings.SplitSeq(s[len(b):], ",") {
+		ra = textproto.TrimString(ra)
+		if ra == "" {
+			continue
+		}
+		before, after, ok := strings.Cut(ra, "-")
+		if !ok {
+			return nil, errors.New("invalid range")
+		}
+		start, end := textproto.TrimString(before), textproto.TrimString(after)
+		var r httpRange
+		if start == "" {
+			// If no start is specified, end specifies the
+			// range start relative to the end of the file.
+			i, err := strconv.ParseInt(end, 10, 64)
+			if err != nil {
+				return nil, errors.New("invalid range")
+			}
+			if i > size {
+				i = size
+			}
+			r.start = size - i
+			r.length = size - r.start
+		} else {
+			i, err := strconv.ParseInt(start, 10, 64)
+			if err != nil || i < 0 {
+				return nil, errors.New("invalid range")
+			}
+			if i >= size {
+				// If the range begins after the size of the content,
+				// then it does not overlap.
+				noOverlap = true
+				continue
+			}
+			r.start = i
+			if end == "" {
+				// If no end is specified, range extends to end of the file.
+				r.length = size - r.start
+			} else {
+				i, err := strconv.ParseInt(end, 10, 64)
+				if err != nil || r.start > i {
+					return nil, errors.New("invalid range")
+				}
+				if i >= size {
+					i = size - 1
+				}
+				r.length = i - r.start + 1
+			}
+		}
+		ranges = append(ranges, r)
+	}
+	if noOverlap && len(ranges) == 0 {
+		// The specified ranges did not overlap with the content.
+		return nil, errNoOverlap
+	}
+	return ranges, nil
+}
+
+// windowChunkSize is the chunk size the window tests use. The bound under test
+// does not depend on it.
+const windowChunkSize = 1024 * 1024 // 1 MiB
+
+// windowTestTimeout bounds every wait in the window tests.
+const windowTestTimeout = 10 * time.Second
+
+// windowServer serves random content with range support and counts the
+// responses it has fully written.
+type windowServer struct {
+	*httptest.Server
+	content []byte
+	served  atomic.Int64
+}
+
+// newWindowServer serves numChunks chunks of windowChunkSize. The handler calls
+// onRequest, if set, with the request and the requested range (empty when
+// none) before responding and fails the request when it returns false.
+func newWindowServer(t *testing.T, numChunks int, onRequest func(r *http.Request, rng []httpRange) bool) *windowServer {
+	ws := &windowServer{content: make([]byte, numChunks*windowChunkSize)}
+	rand.New(rand.NewSource(1)).Read(ws.content)
+	size := int64(len(ws.content))
+	ws.Server = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		defer ws.served.Add(1)
+		rng, err := parseRange(r.Header.Get("Range"), size)
+		if errors.Is(err, errNoOverlap) {
+			err = nil
+		}
+		assert.NoError(t, err)
+		if onRequest != nil && !onRequest(r, rng) {
+			rw.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if len(rng) == 0 {
+			rw.Header().Set("content-length", strconv.Itoa(len(ws.content)))
+			_, _ = rw.Write(ws.content)
+			return
+		}
+		b := ws.content[rng[0].start : rng[0].start+rng[0].length]
+		rw.Header().Set("content-range", rng[0].contentRange(size))
+		rw.Header().Set("content-length", strconv.Itoa(len(b)))
+		_, _ = rw.Write(b)
+	}))
+	t.Cleanup(ws.Close)
+	return ws
+}
+
+// openWindowed opens the server's content through a fetcher with the given
+// parallelism and no download limiter. Only the chunk window can then bound
+// the number of requests.
+func openWindowed(t *testing.T, ctx context.Context, s *windowServer, parallelism int) io.ReadCloser {
+	t.Helper()
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err)
+	f := dockerFetcher{&dockerBase{
+		repository: "nonempty",
+		performances: transfer.ImageResolverPerformanceSettings{
+			MaxConcurrentDownloads:     parallelism,
+			ConcurrentLayerFetchBuffer: windowChunkSize,
+		},
+	}}
+	host := RegistryHost{
+		Client: s.Client(),
+		Host:   u.Host,
+		Scheme: u.Scheme,
+		Path:   u.Path,
+	}
+	rc, _, err := f.open(ctx, f.request(host, http.MethodGet), "", 0, true)
+	require.NoError(t, err)
+	// Close is idempotent. Bounding it here fails the test on a hung Close
+	// even when an earlier assertion failed first.
+	t.Cleanup(func() { _ = returnsWithin(t, "close", rc.Close) })
+	return rc
+}
+
+// returnsWithin runs fn and fails the test if it does not return within
+// windowTestTimeout.
+func returnsWithin(t *testing.T, what string, fn func() error) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(windowTestTimeout):
+		t.Fatalf("%s did not return in time", what)
+		return nil
+	}
+}
+
+// waitCount waits until the counter reaches want.
+func waitCount(t *testing.T, c *atomic.Int64, want int64) {
+	t.Helper()
+	require.Eventually(t, func() bool { return c.Load() == want },
+		windowTestTimeout, time.Millisecond, "count %d not reached", want)
+}
+
+func TestFetcherOpenParallelWindow(t *testing.T) {
+	const (
+		numChunks   = 16
+		parallelism = 4
+	)
+	var started, allowed atomic.Int64
+	allowed.Store(parallelism)
+	s := newWindowServer(t, numChunks, func(*http.Request, []httpRange) bool {
+		if n := started.Add(1); n > allowed.Load() {
+			t.Errorf("request %d started with only %d chunk buffers allowed", n, allowed.Load())
+		}
+		return true
+	})
+	rc := openWindowed(t, context.Background(), s, parallelism)
+
+	// Nothing is consumed yet: the first window fills and no further request
+	// starts.
+	waitCount(t, &started, parallelism)
+
+	// Consuming one chunk admits exactly one more request. The extra byte makes
+	// the MultiReader read past the chunk's EOF, where Read closes drained.
+	got := make([]byte, len(s.content))
+	off := 0
+	for step := int64(1); step <= 2; step++ {
+		allowed.Store(parallelism + step)
+		n, err := io.ReadFull(rc, got[off:off+windowChunkSize+1])
+		require.NoError(t, err)
+		off += n
+		waitCount(t, &started, parallelism+step)
+	}
+
+	allowed.Store(numChunks)
+	_, err := io.ReadFull(rc, got[off:])
+	require.NoError(t, err)
+	n, err := rc.Read(make([]byte, 1))
+	require.Equal(t, 0, n)
+	require.ErrorIs(t, err, io.EOF)
+	require.True(t, bytes.Equal(s.content, got), "content mismatch")
+	require.NoError(t, returnsWithin(t, "close", rc.Close))
+}
+
+func TestFetcherOpenParallelWindowCloseUnblocksProducer(t *testing.T) {
+	const parallelism = 2
+	s := newWindowServer(t, 8, nil)
+	rc := openWindowed(t, context.Background(), s, parallelism)
+
+	// The test reads nothing: once the window is full the producer waits for
+	// the reader to consume chunk 0. Close must still return.
+	waitCount(t, &s.served, parallelism)
+	require.NoError(t, returnsWithin(t, "close", rc.Close))
+}
+
+func TestFetcherOpenParallelWindowCancelThenDrain(t *testing.T) {
+	const parallelism = 2
+	s := newWindowServer(t, 8, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rc := openWindowed(t, ctx, s, parallelism)
+
+	// Let the first window download completely with nothing consumed. The
+	// producer is then waiting for the reader to consume chunk 0. Cancel the
+	// fetch in that state.
+	waitCount(t, &s.served, parallelism)
+	cancel()
+
+	// Draining must return the cancellation error when the reader reaches the
+	// first chunk no worker took.
+	err := returnsWithin(t, "drain", func() error {
+		_, err := io.ReadAll(rc)
+		return err
+	})
+	require.Error(t, err)
+	require.NoError(t, returnsWithin(t, "close", rc.Close))
+}
+
+func TestFetcherOpenParallelWindowErrorAfterAdvance(t *testing.T) {
+	const parallelism = 2
+	// The server fails every request from chunk 5 on, after the window has
+	// advanced.
+	s := newWindowServer(t, 8, func(_ *http.Request, rng []httpRange) bool {
+		return len(rng) == 0 || rng[0].start < 5*windowChunkSize
+	})
+	rc := openWindowed(t, context.Background(), s, parallelism)
+
+	err := returnsWithin(t, "drain", func() error {
+		_, err := io.ReadAll(rc)
+		return err
+	})
+	require.Error(t, err)
+	require.NoError(t, returnsWithin(t, "close", rc.Close))
+}

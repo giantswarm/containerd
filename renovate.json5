@@ -1,0 +1,7 @@
+// Fork (giantswarm/containerd): Renovate is off on this line (FORK.md,
+// "Contributing"). Upstream owns the dependency graph: a bump opened here
+// would diverge from the pin, and every re-pin would have to carry or revert
+// it. Dependencies move when the line is re-pinned.
+{
+  enabled: false,
+}
