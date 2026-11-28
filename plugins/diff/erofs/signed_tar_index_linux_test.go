@@ -19,8 +19,10 @@ package erofs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -177,6 +179,19 @@ func TestApplySignedTarIndex(t *testing.T) {
 		_, statErr := os.Stat(dmverity.SignaturePath(blob))
 		assert.ErrorIs(t, statErr, os.ErrNotExist, "nothing is stored for a refused layer")
 		assert.Empty(t, *checks, "the kernel is not asked about data that does not match the signed root hash")
+	})
+
+	t.Run("refuses a published superblock with a field out of range", func(t *testing.T) {
+		checks := stubKernelCheck(t, nil)
+		crafted := l
+		crafted.tree = bytes.Clone(l.tree)
+		binary.LittleEndian.PutUint16(crafted.tree[80:], 257) // the salt size; the superblock holds 256 bytes
+		blob, desc, _, err := crafted.apply(t, tar, l.rootHash)
+		require.EqualError(t, err, fmt.Sprintf("layer %s: invalid dm-verity superblock at offset %d: failed to adopt params from superblock: verity: superblock salt too large: 257",
+			desc.Digest, l.hashOffset))
+		assert.Empty(t, *checks)
+		_, statErr := os.Stat(dmverity.SignaturePath(blob))
+		assert.ErrorIs(t, statErr, os.ErrNotExist, "nothing is stored for a refused layer")
 	})
 
 	t.Run("refuses data the tree does not cover", func(t *testing.T) {
