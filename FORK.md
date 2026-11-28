@@ -107,7 +107,9 @@ gsoci is the only registry: nothing of the line is published to ghcr.io or as a 
   upstream's conventions and tests, DCO-signed (`git commit -s`), no Giant Swarm references. It is pushed as an
   `upstream/<slug>` branch on this repository, based on the mirror's `main`, and lands on the line as its own pull
   request with its ledger file in `fork/`. Its ledger file reads "to file — prepared in the fork: branch
-  `upstream/<slug>`" until the upstream pull request is opened, and links it from then on. A human reviews the
+  `upstream/<slug>`" until the upstream pull request is opened, and links it from then on. A change to a carried
+  patch lands as a commit of its own, listed in the patch's ledger file next to it (a rebase merge refuses `amend!`
+  and `fixup!` commits); its `upstream/<slug>` branch gets the patch with the change folded in. A human reviews the
   prepared branches in batches, decides what goes upstream and opens it; an agent never opens, comments on, reviews
   or closes a pull request or issue on the upstream repository.
 - **Public only.** This repository is public: a ledger file, a commit message and this file cite public issues and
