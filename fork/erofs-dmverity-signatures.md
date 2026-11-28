@@ -6,6 +6,7 @@ status: carried
 commits:
   - 'erofs: unpack layers from signed dm-verity referrers'
   - 'erofs: share the snapshot of a signed layer between differently signed images'
+  - 'erofs: have the kernel check the signature of a layer at unpack'
 upstream:
   outcome: to-file
   refs: [containerd/containerd#12081]
@@ -26,7 +27,9 @@ and root-hash signature, annotated with the layer digest), behind two options th
   with the pull's own credentials and fails, naming the layer, when one is incomplete or missing.
 - `[plugins."io.containerd.differ.v1.erofs"] enable_dmverity_referrers` builds each layer from the published index, the
   uncompressed tar and the published hash tree (no `mkfs.erofs`), checks the data against the signed root hash once,
-  and stores the signature next to the layer blob.
+  stores the signature next to the layer blob, and has the kernel check that signature before the snapshot is
+  committed: it opens the layer's dm-verity device with the signature, as the mount does, and closes it again. A
+  signature the kernel refuses fails the pull, naming the layer and the kernel's reason; nothing is committed.
 - Enabled means required: the differ refuses native EROFS layers (no signed target) before writing anything, and the
   snapshotter mounts no layer without its stored dm-verity metadata and signature (a snapshot unpacked before the
   option was enabled, a layer content cache entry), uses no merged fsmeta, and refuses `dmverity_mode = "off"`.
@@ -34,9 +37,9 @@ and root-hash signature, annotated with the layer digest), behind two options th
   chain ID: a layer another image already unpacked reuses that snapshot if it carries a signed identity, also when
   this image's referrer signs the layer with another key, again with a signer whose signatures are not deterministic,
   or over another root hash (an index built by another `mkfs.erofs`, the same tar compressed differently). The
-  snapshot holds the same uncompressed layer with the index, hash tree and signature it was unpacked with, and the
-  kernel checks that signature against those device bytes at every mount. A snapshot without a signed identity is not
-  reused; the pull fails, naming the layer.
+  snapshot holds the same uncompressed layer with the index, hash tree and signature it was unpacked with; the kernel
+  accepted that signature at the unpack and checks it against those device bytes at every mount. A snapshot without a
+  signed identity is not reused; the pull fails, naming the layer.
 - The mount handler opens a signed layer with dm-verity's `root_hash_sig_key_desc`, on an OS-locked thread (the
   signature reaches the kernel through the thread keyring).
 
@@ -66,3 +69,12 @@ no EROFS layer mounts there. No containerd release implements milestone 1 of con
   so the snapshot is now reused whenever it carries a signed identity. The line carries the change as a commit of its
   own after the patch; `upstream/erofs-dmverity-signatures` has it folded into the patch's one commit, whose message
   says the same.
+- 2026-11-28: `erofs: have the kernel check the signature of a layer at unpack`. The unpack checked a signed layer
+  in userspace only (the published tree, the root hash against the signed one); the kernel saw the signature first at
+  the mount. Because the first unpack of a shared layer decides the signature its snapshot stores, an image signed by
+  a key the node does not trust, pulled first, left a snapshot that every image sharing the layer then failed to
+  mount, until the snapshot was removed: a publisher signing with a new key before the nodes trust its certificate
+  broke the other images built on the same base layer. The differ now has the kernel open the layer's device with the
+  signature before the snapshot is committed, and the pull of the untrusted image fails instead, naming the layer.
+  The line carries the change as a commit of its own; `upstream/erofs-dmverity-signatures` has it folded into the
+  patch's one commit.
