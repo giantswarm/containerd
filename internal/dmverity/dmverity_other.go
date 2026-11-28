@@ -60,3 +60,7 @@ func VerifyLayer(_ string, _ uint64, _ string) error {
 func OpenSigned(_ string, _ string, _ string, _ string, _ uint64, _ string) (string, error) {
 	return "", errUnsupported
 }
+
+func VerifySignature(_ string, _ string, _ string, _ uint64, _ string) error {
+	return errUnsupported
+}

@@ -19,15 +19,18 @@ package dmverity
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/containerd/log"
 	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/atomicfile"
@@ -404,6 +407,53 @@ func Close(name string) error {
 		return fmt.Errorf("failed to close dm-verity device: %w", err)
 	}
 	return nil
+}
+
+// Seams for tests; opening and removing a device needs root and device-mapper.
+var (
+	openSigned  = OpenSigned
+	verityClose = verity.Close
+)
+
+// VerifySignature has the kernel verify the PKCS#7 signature at signaturePath
+// over rootHash of the layer blob at layerBlobPath, which carries its dm-verity
+// superblock and hash tree at hashOffset. It opens the blob's dm-verity device
+// as OpenSigned does, under name, and closes it again. The kernel checks the
+// signature when the device's table is loaded and refuses the device if no
+// trusted key verifies it; the error then carries the kernel's reason, such as
+// "required key not available" for a signer it does not trust. No device is
+// left behind either way.
+func VerifySignature(layerBlobPath string, name string, rootHash string, hashOffset uint64, signaturePath string) error {
+	_, err := openSigned(layerBlobPath, name, layerBlobPath, rootHash, hashOffset, signaturePath)
+	// The library removes a device the kernel refused; removing it here also
+	// covers a removal that failed there.
+	removeErr := removeDevice(name)
+	switch {
+	case err != nil && removeErr != nil:
+		return fmt.Errorf("%w (%w)", err, removeErr)
+	case err != nil:
+		return err
+	default:
+		return removeErr
+	}
+}
+
+// removeDevice removes the device-mapper device name if it exists. udev probes
+// a device once it is resumed, which keeps it open for a moment, so a busy
+// device is retried for up to a second.
+func removeDevice(name string) error {
+	var err error
+	for range 100 {
+		err = verityClose(name)
+		if err == nil || errors.Is(err, unix.ENXIO) {
+			return nil
+		}
+		if !errors.Is(err, unix.EBUSY) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("failed to close dm-verity device %q: %w", name, err)
 }
 
 // VerifyDevice ensures an existing dm-verity device matches the expected metadata and is healthy.

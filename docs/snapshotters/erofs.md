@@ -326,14 +326,24 @@ layer digest and both root hashes. The signature is stored next to the layer as
 digest in its labels. When the layer is mounted, the signature is handed to
 dm-verity through the kernel keyring of a dedicated, locked OS thread.
 
+Whether the kernel trusts the signature is checked before the snapshot is
+committed: the differ opens the layer's dm-verity device with the signature the
+same way, then closes it again. This costs one device setup and removal per
+unpacked layer and reads no layer data. A signature the kernel refuses, such as
+one by a key that no trusted keyring holds, fails the pull with the layer digest
+and the kernel's reason, and the layer does not become a snapshot.
+
 Snapshots stay keyed by chain ID. A layer that another image already unpacked
 reuses that snapshot if it carries a signed identity, even when this image's
 referrer signs the layer differently: with another key, again with a key whose
 signatures are not deterministic, or over another root hash, because its index
 was built by another `mkfs.erofs` or the same tar was compressed differently.
 The snapshot holds the same uncompressed layer on the same parent chain,
-together with the index, hash tree and signature it was unpacked with, and the
-kernel checks that signature against those exact device bytes at every mount.
+together with the index, hash tree and signature it was unpacked with. The
+kernel accepted that signature when the layer was unpacked, and checks it
+against those exact device bytes at every mount, so an image signed by a key
+the node does not trust leaves no snapshot that would fail the images sharing
+the layer.
 The referrer of every image still has to cover each of its layers, whether or
 not the layer is unpacked already. A snapshot without a signed identity is not
 reused: the pull fails, naming the layer.
