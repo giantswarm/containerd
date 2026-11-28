@@ -7,6 +7,7 @@ commits:
   - 'erofs: unpack layers from signed dm-verity referrers'
   - 'erofs: share the snapshot of a signed layer between differently signed images'
   - 'erofs: have the kernel check the signature of a layer at unpack'
+  - 'erofs: check a published dm-verity superblock before using it'
 upstream:
   outcome: to-file
   refs: [containerd/containerd#12081]
@@ -78,3 +79,10 @@ no EROFS layer mounts there. No containerd release implements milestone 1 of con
   signature before the snapshot is committed, and the pull of the untrusted image fails instead, naming the layer.
   The line carries the change as a commit of its own; `upstream/erofs-dmverity-signatures` has it folded into the
   patch's one commit.
+- 2026-11-28: `erofs: check a published dm-verity superblock before using it`. The unpack read the superblock of a
+  published hash tree checking only its signature and version; when the data did not verify, the diagnostic that
+  computes the data's root hash sliced the salt by the superblock's salt size, so a tree declaring a salt of more than
+  256 bytes crashed containerd on the pull. The superblock now passes the checks the device's open applies (block
+  sizes, hash type and algorithm, salt size) before anything uses it, and a superblock that fails them fails the pull,
+  naming the layer and the field. Carried as a commit of its own; folded into the patch's one commit on
+  `upstream/erofs-dmverity-signatures`.
