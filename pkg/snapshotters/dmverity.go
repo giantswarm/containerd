@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"strings"
 
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/typeurl/v2"
@@ -169,29 +168,35 @@ func GetDmveritySnapshotIdentity(labels map[string]string) (rootHash, signatureD
 }
 
 // ValidateDmveritySnapshot checks that an existing snapshot may be reused for a
-// layer expected to carry the signed identity in expected: it must carry the
-// same root hash and signature digest. A layer without a signed identity
-// accepts any snapshot.
+// layer expected to carry the signed identity in expected: it must carry a
+// signed identity of its own. A layer without a signed identity accepts any
+// snapshot.
+//
+// The two identities need not match. Snapshots are keyed by chain ID, so the
+// existing one holds the same uncompressed layer on the same parent chain,
+// stored with the index, hash tree and signature of the image it was unpacked
+// for, and the mount hands that signature to the kernel, which checks it
+// against those exact device bytes. Which trusted key signed them does not
+// matter. Images that share a layer therefore share its snapshot when their
+// signatures differ (another key, or a signer whose signatures are not
+// deterministic) and when their root hashes differ (an index built by another
+// mkfs.erofs, or the same tar compressed differently). The referrer of every
+// image still has to cover each of its layers: the referrer handler fails the
+// pull for one it does not, whether or not the layer is unpacked.
 func ValidateDmveritySnapshot(existing, expected map[string]string) error {
-	expectedRootHash, expectedSignatureDigest, expectedSigned, err := GetDmveritySnapshotIdentity(expected)
+	_, _, expectedSigned, err := GetDmveritySnapshotIdentity(expected)
 	if err != nil {
 		return fmt.Errorf("invalid expected dm-verity snapshot identity: %w", err)
 	}
 	if !expectedSigned {
 		return nil
 	}
-	existingRootHash, existingSignatureDigest, existingSigned, err := GetDmveritySnapshotIdentity(existing)
+	_, _, existingSigned, err := GetDmveritySnapshotIdentity(existing)
 	if err != nil {
 		return fmt.Errorf("invalid existing dm-verity snapshot identity: %w", err)
 	}
 	if !existingSigned {
 		return errors.New("existing snapshot is not signed for the requested dm-verity layer; remove the affected snapshot and descendants before retrying")
-	}
-	if !strings.EqualFold(existingRootHash, expectedRootHash) {
-		return errors.New("existing snapshot has a different signed dm-verity root hash; remove the affected snapshot and descendants before retrying")
-	}
-	if existingSignatureDigest != expectedSignatureDigest {
-		return errors.New("existing snapshot has a different signed dm-verity signature digest; remove the affected snapshot and descendants before retrying")
 	}
 	return nil
 }
