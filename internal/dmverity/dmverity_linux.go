@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"time"
 
@@ -149,25 +148,23 @@ func WriteMetadata(layerBlobPath string, metadata DmverityMetadata) error {
 }
 
 // VerifyLayer checks a layer blob that carries a published dm-verity
-// superblock and hash tree at hashOffset: the superblock must cover exactly the
-// data in front of it, and the data must verify against the tree up to
-// rootHash. On a mismatch the error names the root hash computed from the data
-// and the expected one.
+// superblock and hash tree at hashOffset: the superblock must pass the checks
+// opening the device applies (block sizes, hash type and algorithm, salt size)
+// and cover exactly the data in front of it, and the data must verify against
+// the tree up to rootHash. On a mismatch the error names the root hash computed
+// from the data and the expected one.
 func VerifyLayer(layerBlobPath string, hashOffset uint64, rootHash string) error {
 	expected, err := utils.ParseRootHash(rootHash)
 	if err != nil {
 		return fmt.Errorf("invalid root hash: %w", err)
 	}
-	f, err := os.Open(layerBlobPath)
-	if err != nil {
-		return err
+	// The superblock is published data: InitParams reads it and checks every
+	// field before anything sizes or indexes by it, as the device's open does.
+	sb := verity.Params{HashAreaOffset: hashOffset}
+	if err := verity.InitParams(&sb, layerBlobPath, layerBlobPath); err != nil {
+		return fmt.Errorf("invalid dm-verity superblock at offset %d: %w", hashOffset, err)
 	}
-	sb, err := verity.ReadSuperblock(f, hashOffset)
-	f.Close()
-	if err != nil {
-		return fmt.Errorf("failed to read dm-verity superblock at offset %d: %w", hashOffset, err)
-	}
-	if sb.DataBlockSize == 0 || sb.DataBlocks*uint64(sb.DataBlockSize) != hashOffset {
+	if hashOffset%uint64(sb.DataBlockSize) != 0 || sb.DataBlocks != hashOffset/uint64(sb.DataBlockSize) {
 		return fmt.Errorf("dm-verity superblock covers %d blocks of %d bytes, the data is %d bytes",
 			sb.DataBlocks, sb.DataBlockSize, hashOffset)
 	}
@@ -187,9 +184,10 @@ func VerifyLayer(layerBlobPath string, hashOffset uint64, rootHash string) error
 	return fmt.Errorf("dm-verity hash tree does not match its data for root hash %s: %w", computed, verifyErr)
 }
 
-// dataRootHash computes the root hash of the data covered by sb, building the
-// hash tree in a temporary file next to the layer blob.
-func dataRootHash(layerBlobPath string, sb *verity.Superblock) (string, error) {
+// dataRootHash computes the root hash of the data with the dm-verity
+// parameters of a checked superblock, building the hash tree in a temporary
+// file next to the layer blob.
+func dataRootHash(layerBlobPath string, sb verity.Params) (string, error) {
 	tmp, err := os.CreateTemp(filepath.Dir(layerBlobPath), ".dmverity-tree-")
 	if err != nil {
 		return "", err
@@ -198,12 +196,12 @@ func dataRootHash(layerBlobPath string, sb *verity.Superblock) (string, error) {
 	defer os.Remove(tmp.Name())
 
 	params := verity.Params{
-		HashName:      strings.TrimRight(string(sb.Algorithm[:]), "\x00"),
+		HashName:      sb.HashName,
 		DataBlockSize: sb.DataBlockSize,
 		HashBlockSize: sb.HashBlockSize,
 		DataBlocks:    sb.DataBlocks,
 		HashType:      sb.HashType,
-		Salt:          slices.Clone(sb.Salt[:sb.SaltSize]),
+		Salt:          sb.Salt,
 		SaltSize:      sb.SaltSize,
 		NoSuperblock:  true,
 	}
