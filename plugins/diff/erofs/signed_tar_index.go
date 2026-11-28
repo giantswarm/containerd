@@ -18,9 +18,11 @@ package erofs
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/internal/dmverity"
@@ -34,11 +36,23 @@ import (
 // dm-verity data blocks over a tar-index layer.
 const tarIndexBlockSize = 512
 
+// Seam for tests; the kernel's signature check needs root and device-mapper.
+var dmverityVerifySignature = dmverity.VerifySignature
+
+// verifyDeviceName names the dm-verity device the kernel checks the signature
+// of the layer blob at layerBlobPath with. The blob belongs to one active
+// snapshot, so the name is unique to the check.
+func verifyDeviceName(layerBlobPath string) string {
+	sum := sha256.Sum256([]byte(layerBlobPath))
+	return fmt.Sprintf("containerd-erofs-verify-%x", sum[:16])
+}
+
 // applySignedTarIndex writes the layer blob from a signed dm-verity target:
 // the published EROFS tar index, the whole uncompressed tar zero-padded to
 // 512 bytes, then the published dm-verity superblock and hash tree. It checks
 // once that the data verifies against the tree and that the tree's root is the
-// signed root hash, and stores the signature and the dm-verity metadata next to
+// signed root hash, and has the kernel check the signature by opening the
+// device with it. It stores the signature and the dm-verity metadata next to
 // the blob for the mount to open the device with.
 func (s erofsDiff) applySignedTarIndex(ctx context.Context, desc ocispec.Descriptor, target *snapshotters.DmverityTarget, tar io.Reader, layerBlobPath string) error {
 	f, err := os.Create(layerBlobPath)
@@ -83,7 +97,8 @@ func (s erofsDiff) applySignedTarIndex(ctx context.Context, desc ocispec.Descrip
 		return fmt.Errorf("layer %s: %w", desc.Digest, err)
 	}
 
-	sig, err := atomicfile.New(dmverity.SignaturePath(layerBlobPath), 0644)
+	signaturePath := dmverity.SignaturePath(layerBlobPath)
+	sig, err := atomicfile.New(signaturePath, 0644)
 	if err != nil {
 		return err
 	}
@@ -94,6 +109,21 @@ func (s erofsDiff) applySignedTarIndex(ctx context.Context, desc ocispec.Descrip
 	if err := sig.Close(); err != nil {
 		return err
 	}
+
+	// Whether the signature is trusted is the kernel's decision, made when it
+	// opens the layer's device. Have it decide now, before the layer becomes a
+	// snapshot that other images with the same layer reuse.
+	start := time.Now()
+	if err := dmverityVerifySignature(layerBlobPath, verifyDeviceName(layerBlobPath), target.RootHash, uint64(hashOffset), signaturePath); err != nil {
+		os.Remove(signaturePath)
+		return fmt.Errorf("layer %s: dm-verity signature %s not accepted by the kernel: %w", desc.Digest, target.Signature.Digest, err)
+	}
+	log.G(ctx).WithFields(log.Fields{
+		"layer":     desc.Digest,
+		"signature": target.Signature.Digest,
+		"duration":  time.Since(start),
+	}).Debug("Kernel accepted the dm-verity signature of the layer")
+
 	if err := dmverity.WriteMetadata(layerBlobPath, dmverity.DmverityMetadata{
 		RootHash:   target.RootHash,
 		HashOffset: uint64(hashOffset),
