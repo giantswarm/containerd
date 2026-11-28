@@ -323,9 +323,20 @@ whole uncompressed tar and the published hash tree, without running
 the tree's root hash is the signed one, and otherwise fails the pull with the
 layer digest and both root hashes. The signature is stored next to the layer as
 `layer.erofs.sig`, and the snapshot records the root hash and the signature
-digest in its labels; an existing snapshot is reused for a signed layer only if
-it carries the same ones. When the layer is mounted, the signature is handed to
+digest in its labels. When the layer is mounted, the signature is handed to
 dm-verity through the kernel keyring of a dedicated, locked OS thread.
+
+Snapshots stay keyed by chain ID. A layer that another image already unpacked
+reuses that snapshot if it carries a signed identity, even when this image's
+referrer signs the layer differently: with another key, again with a key whose
+signatures are not deterministic, or over another root hash, because its index
+was built by another `mkfs.erofs` or the same tar was compressed differently.
+The snapshot holds the same uncompressed layer on the same parent chain,
+together with the index, hash tree and signature it was unpacked with, and the
+kernel checks that signature against those exact device bytes at every mount.
+The referrer of every image still has to cover each of its layers, whether or
+not the layer is unpacked already. A snapshot without a signed identity is not
+reused: the pull fails, naming the layer.
 
 Signed layers are then required: the differ refuses native EROFS layers
 (`application/vnd.erofs.layer.v1`, compressed or not), which come with no signed

@@ -292,9 +292,14 @@ func TestValidateDmveritySnapshot(t *testing.T) {
 		dmverityReferrerRootHashLabel:        testRootHash2,
 		dmverityReferrerSignatureDigestLabel: digest.FromString("sig").String(),
 	}
+	incomplete := map[string]string{
+		dmverityReferrerRootHashLabel: testRootHash1,
+	}
 	assert.NoError(t, ValidateDmveritySnapshot(signed, signed))
+	assert.NoError(t, ValidateDmveritySnapshot(otherSig, signed), "a layer signed by another key, or signed again, reuses the snapshot")
+	assert.NoError(t, ValidateDmveritySnapshot(otherRoot, signed), "a layer indexed differently reuses the snapshot")
 	assert.NoError(t, ValidateDmveritySnapshot(nil, nil), "an unsigned layer reuses any snapshot")
 	assert.ErrorContains(t, ValidateDmveritySnapshot(nil, signed), "existing snapshot is not signed")
-	assert.ErrorContains(t, ValidateDmveritySnapshot(otherRoot, signed), "different signed dm-verity root hash")
-	assert.ErrorContains(t, ValidateDmveritySnapshot(otherSig, signed), "different signed dm-verity signature digest")
+	assert.ErrorContains(t, ValidateDmveritySnapshot(incomplete, signed), "invalid existing dm-verity snapshot identity")
+	assert.ErrorContains(t, ValidateDmveritySnapshot(signed, incomplete), "invalid expected dm-verity snapshot identity")
 }

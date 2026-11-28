@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -671,4 +672,163 @@ func TestUnpackStagedSequential(t *testing.T) {
 		assert.Equal(t, chainIDs[i].String(), c.name)
 		assert.Equal(t, "", c.parent, "a sequentially staged layer is committed without WithParent")
 	}
+}
+
+// labelSnapshotter keeps committed snapshots with their labels. A Prepare whose
+// snapshot ref names a committed snapshot fails with AlreadyExists, as the
+// metadata store does, so unpack takes its reuse path.
+type labelSnapshotter struct {
+	snapshots.Snapshotter
+	mu        sync.Mutex
+	committed map[string]map[string]string
+}
+
+func (s *labelSnapshotter) Prepare(_ context.Context, _, _ string, opts ...snapshots.Opt) ([]mount.Mount, error) {
+	var info snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.committed[info.Labels[snapshots.LabelSnapshotRef]]; ok {
+		return nil, errdefs.ErrAlreadyExists
+	}
+	return nil, nil
+}
+
+func (s *labelSnapshotter) Stat(_ context.Context, key string) (snapshots.Info, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	labels, ok := s.committed[key]
+	if !ok {
+		return snapshots.Info{}, errdefs.ErrNotFound
+	}
+	return snapshots.Info{Name: key, Labels: labels}, nil
+}
+
+func (s *labelSnapshotter) Commit(_ context.Context, name, _ string, opts ...snapshots.Opt) error {
+	var info snapshots.Info
+	for _, opt := range opts {
+		if err := opt(&info); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.committed[name]; ok {
+		return errdefs.ErrAlreadyExists
+	}
+	s.committed[name] = info.Labels
+	return nil
+}
+
+func (s *labelSnapshotter) Remove(context.Context, string) error {
+	return nil
+}
+
+// TestUnpackReusesSignedSnapshotOfAnotherSignature verifies that a layer an
+// image's referrer signed with another signature, or over another root hash,
+// reuses the snapshot another image unpacked it into, with that image's stored
+// identity, and that a snapshot without a signed identity is refused, naming
+// the layer.
+func TestUnpackReusesSignedSnapshotOfAnotherSignature(t *testing.T) {
+	const (
+		rootHashLabel        = "containerd.io/snapshot/erofs.dmverity.root-hash"
+		signatureDigestLabel = "containerd.io/snapshot/erofs.dmverity.signature-digest"
+	)
+	identity := func(rootHash, signature string) map[string]string {
+		return map[string]string{
+			rootHashLabel:        rootHash,
+			signatureDigestLabel: digest.FromString(signature).String(),
+		}
+	}
+	rootHash1 := strings.Repeat("ab", 32)
+	rootHash2 := strings.Repeat("cd", 32)
+
+	ctx := context.Background()
+	blobs := [][]byte{[]byte("base layer"), []byte("top layer")}
+	base := blobDesc(ocispec.MediaTypeImageLayerGzip, blobs[0])
+	top := blobDesc(ocispec.MediaTypeImageLayerGzip, blobs[1])
+	diffIDs := map[digest.Digest]digest.Digest{
+		base.Digest: digest.FromString("base tar"),
+		top.Digest:  digest.FromString("top tar"),
+	}
+	baseChainID := diffIDs[base.Digest].String()
+
+	// unpack unpacks an image of layers, each annotated with its signed
+	// identity, and returns the layers it applied.
+	unpack := func(t *testing.T, sn *labelSnapshotter, layers []ocispec.Descriptor, identities ...map[string]string) ([]digest.Digest, error) {
+		t.Helper()
+		cs := imagetest.NewContentStore(ctx, t)
+		for _, b := range blobs {
+			cs.Blob(ocispec.MediaTypeImageLayerGzip, b)
+		}
+		var rootfs []digest.Digest
+		for i := range layers {
+			layers[i].Annotations = identities[i]
+			rootfs = append(rootfs, diffIDs[layers[i].Digest])
+		}
+		config := cs.JSONObject(ocispec.MediaTypeImageConfig, ocispec.Image{
+			Platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
+			RootFS:   ocispec.RootFS{Type: "layers", DiffIDs: rootfs},
+		}).Descriptor
+		var (
+			mu      sync.Mutex
+			applied []digest.Digest
+		)
+		applier := applierFunc(func(desc ocispec.Descriptor) (ocispec.Descriptor, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			applied = append(applied, desc.Digest)
+			return ocispec.Descriptor{Digest: diffIDs[desc.Digest]}, nil
+		})
+		u, err := NewUnpacker(ctx, cs.Store, WithUnpackPlatform(Platform{
+			Platform:    platforms.All,
+			Snapshotter: sn,
+			Applier:     applier,
+		}))
+		require.NoError(t, err)
+		fetch := images.HandlerFunc(func(context.Context, ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+			return nil, nil
+		})
+		err = u.unpack(fetch, config, layers)
+		return applied, err
+	}
+
+	for _, tc := range []struct {
+		name     string
+		identity map[string]string
+	}{
+		{"another signature", identity(rootHash1, "signature of another key")},
+		{"another root hash", identity(rootHash2, "signature over another index")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sn := &labelSnapshotter{committed: make(map[string]map[string]string)}
+			first := identity(rootHash1, "signature")
+			applied, err := unpack(t, sn, []ocispec.Descriptor{base}, first)
+			require.NoError(t, err)
+			assert.Equal(t, []digest.Digest{base.Digest}, applied)
+
+			applied, err = unpack(t, sn, []ocispec.Descriptor{base, top}, tc.identity, identity(rootHash2, "top signature"))
+			require.NoError(t, err)
+			assert.Equal(t, []digest.Digest{top.Digest}, applied, "the shared layer is not unpacked again")
+			assert.Equal(t, first[rootHashLabel], sn.committed[baseChainID][rootHashLabel], "the shared snapshot keeps its own root hash")
+			assert.Equal(t, first[signatureDigestLabel], sn.committed[baseChainID][signatureDigestLabel], "the shared snapshot keeps its own signature")
+		})
+	}
+
+	t.Run("an unsigned snapshot", func(t *testing.T) {
+		sn := &labelSnapshotter{committed: map[string]map[string]string{baseChainID: {}}}
+		applied, err := unpack(t, sn, []ocispec.Descriptor{base}, identity(rootHash1, "signature"))
+		require.EqualError(t, err, "layer "+base.Digest.String()+": existing snapshot is not signed for the requested dm-verity layer; remove the affected snapshot and descendants before retrying")
+		assert.Empty(t, applied)
+	})
+}
+
+type applierFunc func(ocispec.Descriptor) (ocispec.Descriptor, error)
+
+func (f applierFunc) Apply(_ context.Context, desc ocispec.Descriptor, _ []mount.Mount, _ ...diff.ApplyOpt) (ocispec.Descriptor, error) {
+	return f(desc)
 }
